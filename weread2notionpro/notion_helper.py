@@ -2,15 +2,15 @@ import logging
 import os
 import re
 import time
-
-from notion_client import Client
-import pendulum
-from retrying import retry
 from datetime import timedelta
+
+import pendulum
 from dotenv import load_dotenv
+from notion_client import Client
+from retrying import retry
 
 load_dotenv()
-from weread2notionpro.utils  import (
+from weread2notionpro.utils import (
     format_date,
     get_date,
     get_first_and_last_day_of_month,
@@ -18,11 +18,11 @@ from weread2notionpro.utils  import (
     get_first_and_last_day_of_year,
     get_icon,
     get_number,
+    get_property_value,
     get_relation,
     get_rich_text,
     get_title,
     timestamp_to_date,
-    get_property_value,
 )
 
 TAG_ICON_URL = "https://www.notion.so/icons/tag_gray.svg"
@@ -51,6 +51,7 @@ class NotionHelper:
     show_color = True
     block_type = "callout"
     sync_bookmark = True
+
     def __init__(self):
         self.client = Client(auth=os.getenv("NOTION_TOKEN"), log_level=logging.ERROR)
         self.__cache = {}
@@ -91,7 +92,7 @@ class NotionHelper:
         )
         self.read_database_id = self.database_id_dict.get(
             self.database_name_dict.get("READ_DATABASE_NAME")
-        )  
+        )
         self.setting_database_id = self.database_id_dict.get(
             self.database_name_dict.get("SETTING_DATABASE_NAME")
         )
@@ -112,7 +113,7 @@ class NotionHelper:
         if match:
             return match.group(0)
         else:
-            raise Exception(f"获取NotionID失败，请检查输入的Url是否正确")
+            raise Exception("获取NotionID失败，请检查输入的Url是否正确")
 
     def search_database(self, block_id):
         children = self.client.blocks.children.list(block_id=block_id)["results"]
@@ -124,7 +125,11 @@ class NotionHelper:
                     child.get("id")
                 )
             elif child["type"] == "embed" and child.get("embed").get("url"):
-                if child.get("embed").get("url").startswith("https://heatmap.malinkang.com/"):
+                if (
+                    child.get("embed")
+                    .get("url")
+                    .startswith("https://heatmap.malinkang.com/")
+                ):
                     self.heatmap_block_id = child.get("id")
             # 如果子块有子块，递归调用函数
             if "has_children" in child and child["has_children"]:
@@ -192,8 +197,8 @@ class NotionHelper:
             title=title,
             icon=get_icon("https://www.notion.so/icons/target_gray.svg"),
             properties=properties,
-        ).get("id")    
-        
+        ).get("id")
+
     def create_setting_database(self):
         title = [
             {
@@ -240,17 +245,36 @@ class NotionHelper:
         ).get("id")
 
     def insert_to_setting_database(self):
-        existing_pages = self.query(database_id=self.setting_database_id, filter={"property": "标题", "title": {"equals": "设置"}}).get("results")
+        existing_pages = self.query(
+            database_id=self.setting_database_id,
+            filter={"property": "标题", "title": {"equals": "设置"}},
+        ).get("results")
         properties = {
             "标题": {"title": [{"type": "text", "text": {"content": "设置"}}]},
-            "最后同步时间": {"date": {"start": pendulum.now("Asia/Shanghai").isoformat()}},
-            "NotinToken": {"rich_text": [{"type": "text", "text": {"content": os.getenv("NOTION_TOKEN")}}]},
-            "NotinPage": {"rich_text": [{"type": "text", "text": {"content": os.getenv("NOTION_PAGE")}}]},
-            "WeReadCookie": {"rich_text": [{"type": "text", "text": {"content": os.getenv("WEREAD_COOKIE")}}]},
+            "最后同步时间": {
+                "date": {"start": pendulum.now("Asia/Shanghai").isoformat()}
+            },
+            "NotinToken": {
+                "rich_text": [
+                    {"type": "text", "text": {"content": os.getenv("NOTION_TOKEN")}}
+                ]
+            },
+            "NotinPage": {
+                "rich_text": [
+                    {"type": "text", "text": {"content": os.getenv("NOTION_PAGE")}}
+                ]
+            },
+            "WeReadCookie": {
+                "rich_text": [
+                    {"type": "text", "text": {"content": os.getenv("WEREAD_COOKIE")}}
+                ]
+            },
         }
         if existing_pages:
             remote_properties = existing_pages[0].get("properties")
-            self.show_color = get_property_value(remote_properties.get("根据划线颜色设置文字颜色"))
+            self.show_color = get_property_value(
+                remote_properties.get("根据划线颜色设置文字颜色")
+            )
             self.sync_bookmark = get_property_value(remote_properties.get("同步书签"))
             self.block_type = get_property_value(remote_properties.get("样式"))
             page_id = existing_pages[0].get("id")
@@ -263,8 +287,6 @@ class NotionHelper:
                 parent={"database_id": self.setting_database_id},
                 properties=properties,
             )
-  
-        
 
     def update_heatmap(self, block_id, url):
         # 更新 image block 的链接
@@ -281,7 +303,9 @@ class NotionHelper:
         )
 
     def get_month_relation_id(self, date):
-        month = date.strftime("%Y年%-m月")
+        # Windows不支持%-m格式，使用%m然后去掉前导零
+        month_num = str(int(date.strftime("%m")))
+        month = date.strftime("%Y年") + month_num + "月"
         start, end = get_first_and_last_day_of_month(date)
         properties = {"日期": get_date(format_date(start), format_date(end))}
         return self.get_relation_id(
@@ -414,7 +438,6 @@ class NotionHelper:
             page_id=page_id, properties=properties, cover=cover
         )
 
-
     @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def create_page(self, parent, properties, icon):
         return self.client.pages.create(parent=parent, properties=properties, icon=icon)
@@ -441,9 +464,9 @@ class NotionHelper:
 
     @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def append_blocks_after(self, block_id, children, after):
-        #奇怪不知道为什么会多插入一个children，没找到问题，先暂时这么解决，搜索是否有parent
+        # 奇怪不知道为什么会多插入一个children，没找到问题，先暂时这么解决，搜索是否有parent
         parent = self.client.blocks.retrieve(after).get("parent")
-        if(parent.get("type")=="block_id"):
+        if parent.get("type") == "block_id":
             after = parent.get("block_id")
         return self.client.blocks.children.append(
             block_id=block_id, children=children, after=after

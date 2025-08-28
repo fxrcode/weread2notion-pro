@@ -1,6 +1,6 @@
-from weread2notionpro.notion_helper import NotionHelper
-from weread2notionpro.weread_api import WeReadApi
+import logging
 
+from weread2notionpro.notion_helper import NotionHelper
 from weread2notionpro.utils import (
     get_block,
     get_heading,
@@ -10,6 +10,10 @@ from weread2notionpro.utils import (
     get_rich_text_from_result,
     get_table_of_contents,
 )
+from weread2notionpro.weread_api import WeReadApi
+
+# 获取logger实例
+logger = logging.getLogger(__name__)
 
 
 def get_bookmark_list(page_id, bookId):
@@ -40,7 +44,7 @@ def get_bookmark_list(page_id, bookId):
     return bookmarks
 
 
-def get_review_list(page_id,bookId):
+def get_review_list(page_id, bookId):
     """获取笔记"""
     filter = {
         "and": [
@@ -97,7 +101,6 @@ def get_sort():
     return 0
 
 
-
 def sort_notes(page_id, chapter, bookmark_list):
     """对笔记进行排序"""
     bookmark_list = sorted(
@@ -144,7 +147,7 @@ def sort_notes(page_id, chapter, bookmark_list):
 
 
 def append_blocks(id, contents):
-    print(f"笔记数{len(contents)}")
+    logger.info(f"笔记数{len(contents)}")
     before_block_id = ""
     block_children = notion_helper.get_block_children(id)
     if len(block_children) > 0 and block_children[0].get("type") == "table_of_contents":
@@ -164,7 +167,7 @@ def append_blocks(id, contents):
             l.extend(results)
             blocks.clear()
             sub_contents.clear()
-            if not notion_helper.sync_bookmark and content.get("type")==0:
+            if not notion_helper.sync_bookmark and content.get("type") == 0:
                 continue
             blocks.append(content_to_block(content))
             sub_contents.append(content)
@@ -177,15 +180,15 @@ def append_blocks(id, contents):
                 sub_contents.clear()
             before_block_id = content["blockId"]
         else:
-            if not notion_helper.sync_bookmark and content.get("type")==0:
+            if not notion_helper.sync_bookmark and content.get("type") == 0:
                 continue
             blocks.append(content_to_block(content))
             sub_contents.append(content)
-    
+
     if len(blocks) > 0:
         l.extend(append_blocks_to_notion(id, blocks, before_block_id, sub_contents))
     for index, value in enumerate(l):
-        print(f"正在插入第{index+1}条笔记，共{len(l)}条")
+        logger.info(f"正在插入第{index + 1}条笔记，共{len(l)}条")
         if "bookmarkId" in value:
             notion_helper.insert_bookmark(id, value)
         elif "reviewId" in value:
@@ -197,7 +200,7 @@ def append_blocks(id, contents):
 def content_to_block(content):
     if "bookmarkId" in content:
         return get_block(
-            content.get("markText",""),
+            content.get("markText", ""),
             notion_helper.block_type,
             notion_helper.show_color,
             content.get("style"),
@@ -206,7 +209,7 @@ def content_to_block(content):
         )
     elif "reviewId" in content:
         return get_block(
-            content.get("content",""),
+            content.get("content", ""),
             notion_helper.block_type,
             notion_helper.show_color,
             content.get("style"),
@@ -233,33 +236,82 @@ def append_blocks_to_notion(id, blocks, after, contents):
         l.append(content)
     return l
 
+
 weread_api = WeReadApi()
 notion_helper = NotionHelper()
-def main():
+
+
+def main(target_book_id=None):
     notion_books = notion_helper.get_all_book()
     books = weread_api.get_notebooklist()
     if books != None:
+        # 如果指定了目标书籍ID，只处理该书籍
+        if target_book_id:
+            books = [book for book in books if book.get("bookId") == target_book_id]
+            if not books:
+                logger.warning(f"未找到指定的书籍 {target_book_id}")
+                return
+            logger.info(f"指定同步书籍: {target_book_id}")
+
         for index, book in enumerate(books):
             bookId = book.get("bookId")
-            title = book.get("book").get("title")
+            title = book.get("title")
+            author = book.get("author", "未知作者")
             sort = book.get("sort")
+            note_count = book.get("noteCount", 0)
+            review_count = book.get("reviewCount", 0)
+
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"开始处理第 {index + 1}/{len(books)} 本书籍")
+            logger.info(f"书籍信息: 《{title}》 - {author}")
+            logger.info(f"书籍ID: {bookId}")
+            logger.info(f"笔记统计: {note_count} 个标注, {review_count} 个想法")
+            logger.info(f"排序值: {sort}")
+
+            if not title:
+                logger.warning(f"跳过书籍 {bookId}，缺少书籍标题")
+                continue
             if bookId not in notion_books:
+                logger.info(f"书籍《{title}》不在Notion数据库中，跳过同步")
                 continue
             if sort == notion_books.get(bookId).get("Sort"):
+                logger.info(f"书籍《{title}》的排序值未变化，跳过同步")
                 continue
+
             pageId = notion_books.get(bookId).get("pageId")
-            print(f"正在同步《{title}》,一共{len(books)}本，当前是第{index+1}本。")
+            logger.info(f"开始同步《{title}》的笔记内容...")
+
             chapter = weread_api.get_chapter_info(bookId)
+            logger.info(f"获取章节信息完成，章节数: {len(chapter) if chapter else 0}")
+
             bookmark_list = get_bookmark_list(pageId, bookId)
-            reviews = get_review_list(pageId,bookId)
+            logger.info(f"获取标注列表完成，标注数: {len(bookmark_list)}")
+
+            reviews = get_review_list(pageId, bookId)
+            logger.info(f"获取想法列表完成，想法数: {len(reviews)}")
+
             bookmark_list.extend(reviews)
+            total_notes = len(bookmark_list)
+            logger.info(f"合并后总笔记数: {total_notes}")
+
             content = sort_notes(pageId, chapter, bookmark_list)
+            logger.info("笔记排序完成，准备写入Notion...")
+
             append_blocks(pageId, content)
-            properties = {
-                "Sort":get_number(sort)
-            }
-            notion_helper.update_book_page(page_id=pageId,properties=properties)
+            logger.info("笔记内容写入完成")
+
+            properties = {"Sort": get_number(sort)}
+            notion_helper.update_book_page(page_id=pageId, properties=properties)
+            logger.info("书籍属性更新完成")
+            logger.info(f"《{title}》同步完成！")
+            logger.info(f"{'=' * 60}\n")
+
 
 if __name__ == "__main__":
-    main()
+    import sys
 
+    # 支持命令行参数指定书籍ID
+    target_book_id = sys.argv[1] if len(sys.argv) > 1 else None
+    if target_book_id:
+        logger.info(f"命令行指定同步书籍ID: {target_book_id}")
+    main(target_book_id)

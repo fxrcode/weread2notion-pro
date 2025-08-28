@@ -1,23 +1,26 @@
-import calendar
-from datetime import datetime
-from datetime import timedelta
-import hashlib
-import os
-import re
-import requests
 import base64
-from weread2notionpro.config  import (
-    RICH_TEXT,
-    URL,
-    RELATION,
-    NUMBER,
+import calendar
+import hashlib
+import logging
+import os
+from datetime import datetime, timedelta
+
+import pendulum
+import requests
+
+from weread2notionpro.config import (
     DATE,
     FILES,
+    NUMBER,
+    RELATION,
+    RICH_TEXT,
+    SELECT,
     STATUS,
     TITLE,
-    SELECT,
+    URL,
 )
-import pendulum
+
+logger = logging.getLogger(__name__)
 
 MAX_LENGTH = (
     1024  # NOTION 2000个字符限制https://developers.notion.com/reference/request-limits
@@ -114,7 +117,7 @@ def get_quote(content):
     }
 
 
-def get_block(content,type,show_color, style, colorStyle, reviewId):
+def get_block(content, type, show_color, style, colorStyle, reviewId):
     color = "default"
     if show_color:
         # 根据划线颜色设置文字的颜色
@@ -142,7 +145,7 @@ def get_block(content,type,show_color, style, colorStyle, reviewId):
             "color": color,
         },
     }
-    if(type=="callout"):
+    if type == "callout":
         # 根据不同的划线样式设置不同的emoji 直线type=0 背景颜色是1 波浪线是2
         emoji = "〰️"
         if style == 0:
@@ -219,6 +222,7 @@ def get_first_and_last_day_of_week(date):
 
     return first_day_of_week, last_day_of_week
 
+
 def get_properties(dict1, dict2):
     properties = {}
     for key, value in dict1.items():
@@ -289,8 +293,6 @@ def get_property_value(property):
         return content
 
 
-
-
 def str_to_timestamp(date):
     if date == None:
         return 0
@@ -313,7 +315,7 @@ def upload_image(folder_path, filename, file_path):
     response = requests.post(upload_url, json=data)
 
     if response.status_code == 200:
-        print("File uploaded successfully.")
+        logger.info("File uploaded successfully.")
         return response.text
     else:
         return None
@@ -346,7 +348,7 @@ def download_image(url, save_dir="cover"):
 
     # 检查文件是否已经存在，如果存在则不进行下载
     if os.path.exists(save_path):
-        print(f"File {file_name} already exists. Skipping download.")
+        logger.info(f"File {file_name} already exists. Skipping download.")
         return save_path
 
     response = requests.get(url, stream=True)
@@ -354,11 +356,10 @@ def download_image(url, save_dir="cover"):
         with open(save_path, "wb") as file:
             for chunk in response.iter_content(chunk_size=128):
                 file.write(chunk)
-        print(f"Image downloaded successfully to {save_path}")
+        logger.info(f"Image downloaded successfully to {save_path}")
     else:
-        print(f"Failed to download image. Status code: {response.status_code}")
+        logger.error(f"Failed to download image. Status code: {response.status_code}")
     return save_path
-
 
 
 def get_embed(url):
