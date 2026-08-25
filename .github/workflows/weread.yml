@@ -3,10 +3,12 @@ name: weread note sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */12 * * *'  # 每 12 小时执行一次 (原来是2hr, 因为数据太大, 所以还是改大点, 否则会被另一个action cacnel)
+    - cron: '0 0 * * *'  # 每天执行一次 (00:00 UTC)
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
   sync:
     name: Sync
@@ -33,21 +35,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.11
+          python-version: "3.12"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
+
       - name: weread book sync
         run: |
           book
+
       - name: weread sync
         run: |
           weread
+
       - name: Upload logs as artifacts
         uses: actions/upload-artifact@v4
         if: always()  # 无论成功或失败都上传日志
@@ -55,4 +62,3 @@ jobs:
           name: weread-sync-logs-${{ github.run_number }}
           path: logs/
           retention-days: 30  # 保留30天
-      
