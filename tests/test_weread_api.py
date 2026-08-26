@@ -6,6 +6,7 @@ from weread2notionpro.weread_api import (
     SKILL_VERSION,
     WeReadApi,
     WeReadApiError,
+    WeReadApiRateLimitError,
 )
 
 
@@ -221,6 +222,23 @@ class WeReadApiTest(unittest.TestCase):
 
         self.assertEqual(bookmarks[0]["bookmarkId"], "bookmark-1")
         sleep.assert_called_once_with(60)
+
+    def test_exhausted_rate_limit_has_distinct_error(self):
+        session = FakeSession([({"errmsg": "busy"}, 499)] * 4)
+        api = WeReadApi(api_key="wrk-test", session=session)
+
+        with mock.patch("weread2notionpro.weread_api.time.sleep"):
+            with self.assertRaises(WeReadApiRateLimitError):
+                api.get_bookmark_list("book-1")
+
+        self.assertEqual(len(session.calls), 4)
+
+    def test_rate_limit_in_success_response_has_distinct_error(self):
+        session = FakeSession([{"errcode": -1, "errmsg": "请求次数已用完"}])
+        api = WeReadApi(api_key="wrk-test", session=session)
+
+        with self.assertRaises(WeReadApiRateLimitError):
+            api.get_bookmark_list("book-1")
 
 
 if __name__ == "__main__":

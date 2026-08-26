@@ -6,7 +6,11 @@ import pendulum
 from weread2notionpro import utils
 from weread2notionpro.config import book_properties_type_dict, tz
 from weread2notionpro.notion_helper import NotionHelper
-from weread2notionpro.weread_api import WeReadApi, WeReadApiError
+from weread2notionpro.weread_api import (
+    WeReadApi,
+    WeReadApiError,
+    WeReadApiRateLimitError,
+)
 
 # 获取logger实例
 logger = logging.getLogger(__name__)
@@ -494,11 +498,21 @@ def main():
 
         logger.info("6. 分析需要同步的书籍...")
         not_need_sync = []
+        repair_candidates = []
         repair_zero_reading_time = (
             os.getenv("REPAIR_ZERO_READING_TIME", "false").lower() == "true"
         )
+        try:
+            repair_limit = max(
+                int(os.getenv("REPAIR_ZERO_READING_TIME_LIMIT", "400")), 0
+            )
+        except ValueError:
+            repair_limit = 400
+            logger.warning("   修复批次上限配置无效，使用默认值 400")
         if repair_zero_reading_time:
-            logger.warning("   已启用零阅读时长修复模式")
+            logger.warning(
+                f"   已启用零阅读时长修复模式，本次最多修复 {repair_limit} 本"
+            )
         for key, value in notion_books.items():
             shelf_book = all_books_dict.get(key, {})
             shelf_update_time = shelf_book.get("readUpdateTime") or 0
@@ -518,9 +532,8 @@ def main():
                 and value.get("readingTime") == 0
                 and shelf_update_time > 0
             )
-            if (
+            otherwise_unchanged = (
                 progress_unchanged
-                and not needs_zero_time_repair
                 and (not shelf_finished or value.get("status") == "已读")
                 and (archive_dict.get(key) == value.get("category"))
                 and (value.get("cover") is not None)
@@ -528,19 +541,50 @@ def main():
                     value.get("status") != "已读"
                     or (value.get("status") == "已读" and value.get("myRating"))
                 )
-            ):
-                not_need_sync.append(key)
+            )
+            if otherwise_unchanged:
+                if needs_zero_time_repair:
+                    repair_candidates.append(key)
+                else:
+                    not_need_sync.append(key)
+
+        selected_repairs = repair_candidates
+        if repair_candidates and len(repair_candidates) > repair_limit:
+            run_number = int(os.getenv("GITHUB_RUN_NUMBER", "0") or 0)
+            start = (run_number * repair_limit) % len(repair_candidates)
+            rotated_candidates = (
+                repair_candidates[start:] + repair_candidates[:start]
+            )
+            selected_repairs = rotated_candidates[:repair_limit]
+        selected_repair_ids = set(selected_repairs)
+        deferred_repairs = [
+            book_id
+            for book_id in repair_candidates
+            if book_id not in selected_repair_ids
+        ]
+        not_need_sync.extend(deferred_repairs)
+        if repair_zero_reading_time:
+            logger.warning(
+                f"   找到 {len(repair_candidates)} 本待修复书籍，本次处理 "
+                f"{len(selected_repairs)} 本，"
+                f"延后 {len(deferred_repairs)} 本"
+            )
         logger.info(f"   {len(not_need_sync)} 本书无需同步")
 
         logger.info("7. 整理需要同步的书籍列表...")
         # 从所有书架书籍中提取书籍ID
-        all_book_ids = [book.get("bookId") for book in all_books if book.get("bookId")]
+        all_book_ids = list(
+            dict.fromkeys(
+                book.get("bookId") for book in all_books if book.get("bookId")
+            )
+        )
         logger.info(f"   从书架获取到 {len(all_book_ids)} 本书")
 
         logger.info(f"   构建书架字典，包含 {len(all_books_dict)} 本书")
 
         # 使用所有书架书籍，去除无需同步的书籍
-        books = list(set(all_book_ids) - set(not_need_sync))
+        not_need_sync_ids = set(not_need_sync)
+        books = [book_id for book_id in all_book_ids if book_id not in not_need_sync_ids]
         logger.info(f"   共需要同步 {len(books)} 本书")
 
         logger.info("8. 开始同步书籍...")
@@ -549,6 +593,12 @@ def main():
             try:
                 insert_book_to_notion(books, index, bookId, all_books_dict)
                 logger.info(f"   ✓ 书籍 {bookId} 同步成功")
+            except WeReadApiRateLimitError:
+                logger.error("   微信读书 API 配额已耗尽，立即停止书架同步")
+                raise
+            except WeReadApiError as e:
+                logger.error(f"   ✗ 书籍 {bookId} API请求失败: {str(e)}")
+                continue
             except Exception as e:
                 logger.error(f"   ✗ 书籍 {bookId} 同步失败: {str(e)}")
                 continue

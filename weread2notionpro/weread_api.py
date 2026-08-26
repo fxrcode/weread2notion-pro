@@ -38,6 +38,10 @@ class WeReadApiError(RuntimeError):
     """Raised when the official WeRead gateway rejects a request."""
 
 
+class WeReadApiRateLimitError(WeReadApiError):
+    """Raised when requests must stop until the gateway quota resets."""
+
+
 class WeReadApi:
     def __init__(self, api_key=None, session=None):
         self.api_key = api_key or os.getenv("WEREAD_API_KEY")
@@ -128,10 +132,17 @@ class WeReadApi:
                 else None
             )
             detail = f": {errmsg}" if errmsg else ""
-            raise WeReadApiError(
+            error = (
                 f"微信读书API HTTP错误 ({api_name}): "
                 f"{response.status_code}{detail}"
             )
+            logger.error(error)
+            error_type = (
+                WeReadApiRateLimitError
+                if response.status_code in (429, 499)
+                else WeReadApiError
+            )
+            raise error_type(error)
         else:
             raise WeReadApiError(f"微信读书API重试失败 ({api_name})")
 
@@ -152,9 +163,25 @@ class WeReadApi:
         errcode = data.get("errcode", data.get("errCode", 0))
         if errcode:
             errmsg = data.get("errmsg", data.get("errMsg", "未知错误"))
-            raise WeReadApiError(
+            error = (
                 f"微信读书API返回错误 ({api_name}): {errmsg} (错误码: {errcode})"
             )
+            logger.error(error)
+            normalized_message = str(errmsg).lower()
+            is_rate_limit = any(
+                marker in normalized_message
+                for marker in (
+                    "频繁",
+                    "限流",
+                    "配额",
+                    "次数",
+                    "quota",
+                    "rate limit",
+                    "too many",
+                )
+            )
+            error_type = WeReadApiRateLimitError if is_rate_limit else WeReadApiError
+            raise error_type(error)
 
         return data
 
