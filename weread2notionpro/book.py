@@ -1,4 +1,5 @@
 import logging
+import os
 
 import pendulum
 
@@ -129,7 +130,7 @@ def insert_book_to_notion(books, index, bookId, all_books_dict=None):
         logger.info(
             f"   书籍《{book.get('title', '未知书名')}》阅读进度达到100%，自动设置状态为已读"
         )
-    elif book.get("readingTime", 0) >= 60:
+    elif readingProgress > 0 or (book.get("readingTime") or 0) >= 60:
         status = "在读"
     book["阅读状态"] = status
     book["阅读时长"] = book.get("readingTime")
@@ -493,7 +494,14 @@ def main():
 
         logger.info("6. 分析需要同步的书籍...")
         not_need_sync = []
+        repair_zero_reading_time = (
+            os.getenv("REPAIR_ZERO_READING_TIME", "false").lower() == "true"
+        )
+        if repair_zero_reading_time:
+            logger.warning("   已启用零阅读时长修复模式")
         for key, value in notion_books.items():
+            shelf_book = all_books_dict.get(key, {})
+            shelf_update_time = shelf_book.get("readUpdateTime") or 0
             if key in bookProgress:
                 progress_unchanged = (
                     value.get("readingTime")
@@ -501,14 +509,18 @@ def main():
                 )
             else:
                 # 官方书架 API 用 readUpdateTime 表示阅读进度最近更新时间。
-                shelf_book = all_books_dict.get(key, {})
-                shelf_update_time = shelf_book.get("readUpdateTime") or 0
                 notion_update_time = value.get("lastReadingTime") or 0
                 progress_unchanged = shelf_update_time <= notion_update_time
 
             shelf_finished = all_books_dict.get(key, {}).get("finishReading") == 1
+            needs_zero_time_repair = (
+                repair_zero_reading_time
+                and value.get("readingTime") == 0
+                and shelf_update_time > 0
+            )
             if (
                 progress_unchanged
+                and not needs_zero_time_repair
                 and (not shelf_finished or value.get("status") == "已读")
                 and (archive_dict.get(key) == value.get("category"))
                 and (value.get("cover") is not None)

@@ -2,6 +2,12 @@ name: weread note sync
 
 on:
   workflow_dispatch:
+    inputs:
+      repair_zero_reading_time:
+        description: Repair books whose reading time was reset to zero
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: '0 0 * * *'  # 每天执行一次 (00:00 UTC)
 
@@ -17,6 +23,7 @@ jobs:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       NOTION_PAGE: ${{ secrets.NOTION_PAGE }}
       WEREAD_API_KEY: ${{ secrets.WEREAD_API_KEY }}
+      REPAIR_ZERO_READING_TIME: ${{ github.event.inputs.repair_zero_reading_time || 'false' }}
       BOOK_DATABASE_NAME: ${{ vars.BOOK_DATABASE_NAME }}
       AUTHOR_DATABASE_NAME: ${{ vars.AUTHOR_DATABASE_NAME }}
       CATEGORY_DATABASE_NAME: ${{ vars.CATEGORY_DATABASE_NAME }}

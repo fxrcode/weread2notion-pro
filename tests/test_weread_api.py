@@ -142,6 +142,7 @@ class WeReadApiTest(unittest.TestCase):
         session = FakeSession(
             [
                 {
+                    "readDays": 0,
                     "book": {
                         "progress": 98,
                         "recordReadingTime": 3600,
@@ -155,6 +156,27 @@ class WeReadApiTest(unittest.TestCase):
         result = api.get_read_info("book-1")
 
         self.assertEqual(result["markedStatus"], 4)
+        self.assertNotIn("totalReadDay", result)
+
+    def test_reading_time_prefers_actual_time_over_record_time(self):
+        session = FakeSession(
+            [
+                {
+                    "readDays": 0,
+                    "book": {
+                        "progress": 41,
+                        "readingTime": 744,
+                        "recordReadingTime": 0,
+                    }
+                }
+            ]
+        )
+        api = WeReadApi(api_key="wrk-test", session=session)
+
+        result = api.get_read_info("book-1")
+
+        self.assertEqual(result["readingTime"], 744)
+        self.assertNotIn("totalReadDay", result)
 
     def test_empty_chapter_response_preserves_existing_chapters(self):
         session = FakeSession([{"chapters": []}])

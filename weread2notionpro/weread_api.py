@@ -294,9 +294,10 @@ class WeReadApi:
         data = self._request("/book/getprogress", bookId=str(bookId))
         book_data = data.get("book") or {}
         progress = book_data.get("progress", 0)
-        reading_time = book_data.get(
-            "recordReadingTime", book_data.get("readingTime", 0)
-        )
+        reading_time = book_data.get("readingTime")
+        if reading_time is None:
+            reading_time = book_data.get("recordReadingTime", 0)
+        read_days = data.get("readDays", book_data.get("readDays"))
 
         result = {
             "bookId": str(bookId),
@@ -307,7 +308,6 @@ class WeReadApi:
             "markedStatus": (
                 4 if progress >= 100 or book_data.get("finishTime") else 1
             ),
-            "totalReadDay": data.get("readDays", 0),
             "startReadingTime": book_data.get("startReadingTime"),
             "finishedDate": book_data.get("finishTime"),
             "finishTime": book_data.get("finishTime"),
@@ -320,6 +320,8 @@ class WeReadApi:
             "bookInfo": data.get("bookInfo", {}),
             "book": book_data,
         }
+        if read_days:
+            result["totalReadDay"] = read_days
         logger.info(
             f"获取阅读进度: bookId={bookId}, 进度={progress}%, "
             f"阅读时长={reading_time}秒"
