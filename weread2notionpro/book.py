@@ -5,7 +5,7 @@ import pendulum
 from weread2notionpro import utils
 from weread2notionpro.config import book_properties_type_dict, tz
 from weread2notionpro.notion_helper import NotionHelper
-from weread2notionpro.weread_api import WeReadApi
+from weread2notionpro.weread_api import WeReadApi, WeReadApiError
 
 # 获取logger实例
 logger = logging.getLogger(__name__)
@@ -26,7 +26,21 @@ def insert_book_to_notion(books, index, bookId, all_books_dict=None):
 
     # 优先从所有书本数据获取详细信息，如果没有则通过API获取
     if all_books_dict and bookId in all_books_dict:
-        shelf_book = all_books_dict[bookId]
+        shelf_book = all_books_dict[bookId].copy()
+        # 官方书架 API 只返回摘要；新书用详情接口补齐 ISBN、简介等字段。
+        if bookId not in notion_books:
+            try:
+                book_info = weread_api.get_bookinfo(bookId)
+                shelf_book.update(
+                    {key: value for key, value in book_info.items() if value}
+                )
+            except WeReadApiError as exc:
+                logger.warning(
+                    f"   获取新书 {bookId} 的详情失败，使用书架摘要继续同步: {exc}"
+                )
+        categories = shelf_book.get("categories") or []
+        if not categories and shelf_book.get("category"):
+            categories = [{"title": shelf_book["category"]}]
         book_title = shelf_book.get("title", "未知书名")
         logger.info(f"   从书架数据获取书籍信息: {book_title} (bookId: {bookId})")
         book.update(
@@ -35,12 +49,15 @@ def insert_book_to_notion(books, index, bookId, all_books_dict=None):
                 "author": shelf_book.get("author", "未知作者"),
                 "cover": shelf_book.get("cover", ""),
                 "bookId": bookId,
-                "categories": shelf_book.get("categories", []),
+                "categories": categories,
                 "intro": shelf_book.get("intro", ""),
                 "isbn": shelf_book.get("isbn", ""),
                 "price": shelf_book.get("price", 0),
                 "publishTime": shelf_book.get("publishTime", ""),
                 "translator": shelf_book.get("translator", ""),
+                "deepLink": shelf_book.get("deepLink"),
+                "newRating": shelf_book.get("newRating"),
+                "newRatingDetail": shelf_book.get("newRatingDetail"),
             }
         )
     else:
@@ -48,6 +65,9 @@ def insert_book_to_notion(books, index, bookId, all_books_dict=None):
         try:
             book_info = weread_api.get_bookinfo(bookId)
             if book_info:
+                categories = book_info.get("categories") or []
+                if not categories and book_info.get("category"):
+                    categories = [{"title": book_info["category"]}]
                 api_book_title = book_info.get("title", "未知书名")
                 logger.info(
                     f"   通过API获取书籍信息: {api_book_title} (bookId: {bookId})"
@@ -58,12 +78,15 @@ def insert_book_to_notion(books, index, bookId, all_books_dict=None):
                         "author": book_info.get("author", "未知作者"),
                         "cover": book_info.get("cover", ""),
                         "bookId": bookId,
-                        "categories": book_info.get("categories", []),
+                        "categories": categories,
                         "intro": book_info.get("intro", ""),
                         "isbn": book_info.get("isbn", ""),
                         "price": book_info.get("price", 0),
                         "publishTime": book_info.get("publishTime", ""),
                         "translator": book_info.get("translator", ""),
+                        "deepLink": book_info.get("deepLink"),
+                        "newRating": book_info.get("newRating"),
+                        "newRatingDetail": book_info.get("newRatingDetail"),
                     }
                 )
             else:
@@ -114,6 +137,8 @@ def insert_book_to_notion(books, index, bookId, all_books_dict=None):
     book["评分"] = book.get("newRating")
     if book.get("newRatingDetail") and book.get("newRatingDetail").get("myRating"):
         book["我的评分"] = rating.get(book.get("newRatingDetail").get("myRating"))
+    elif book.get("myRating"):
+        book["我的评分"] = book.get("myRating")
     elif status == "已读":
         book["我的评分"] = "未评分"
 
@@ -212,7 +237,7 @@ def insert_book_to_notion(books, index, bookId, all_books_dict=None):
         book["书名"] = book.get("title")
         book["BookId"] = book.get("bookId")
         book["ISBN"] = book.get("isbn")
-        book["链接"] = weread_api.get_url(bookId)
+        book["链接"] = book.get("deepLink") or weread_api.get_url(bookId)
         book["简介"] = book.get("intro")
         author = book.get("author")
         if author and isinstance(author, str):
@@ -462,15 +487,29 @@ def main():
             archive_dict.update({bookId: name for bookId in bookIds})
             logger.info(f"   分类 '{name}' 包含 {len(bookIds)} 本书")
 
+        all_books_dict = {
+            book.get("bookId"): book for book in all_books if book.get("bookId")
+        }
+
         logger.info("6. 分析需要同步的书籍...")
         not_need_sync = []
         for key, value in notion_books.items():
-            if (
-                (
-                    key not in bookProgress
-                    or value.get("readingTime")
+            if key in bookProgress:
+                progress_unchanged = (
+                    value.get("readingTime")
                     == bookProgress.get(key).get("readingTime")
                 )
+            else:
+                # 官方书架 API 用 readUpdateTime 表示阅读进度最近更新时间。
+                shelf_book = all_books_dict.get(key, {})
+                shelf_update_time = shelf_book.get("readUpdateTime") or 0
+                notion_update_time = value.get("lastReadingTime") or 0
+                progress_unchanged = shelf_update_time <= notion_update_time
+
+            shelf_finished = all_books_dict.get(key, {}).get("finishReading") == 1
+            if (
+                progress_unchanged
+                and (not shelf_finished or value.get("status") == "已读")
                 and (archive_dict.get(key) == value.get("category"))
                 and (value.get("cover") is not None)
                 and (
@@ -486,10 +525,6 @@ def main():
         all_book_ids = [book.get("bookId") for book in all_books if book.get("bookId")]
         logger.info(f"   从书架获取到 {len(all_book_ids)} 本书")
 
-        # 将所有书籍转换为字典形式，以bookId为键
-        all_books_dict = {
-            book.get("bookId"): book for book in all_books if book.get("bookId")
-        }
         logger.info(f"   构建书架字典，包含 {len(all_books_dict)} 本书")
 
         # 使用所有书架书籍，去除无需同步的书籍

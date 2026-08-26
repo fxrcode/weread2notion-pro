@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 def get_bookmark_list(page_id, bookId):
     """获取我的划线"""
+    def is_exported_highlight(result):
+        type_property = (result.get("properties") or {}).get("type")
+        return type_property is None or type_property.get("number") != 0
+
     filter = {
         "and": [
             {"property": "书籍", "relation": {"contains": page_id}},
@@ -32,8 +36,14 @@ def get_bookmark_list(page_id, bookId):
             x, "blockId"
         )
         for x in results
+        # 官方 API 只导出划线，不导出 type=0 的书签；保留历史书签数据。
+        if is_exported_highlight(x)
     }
-    dict2 = {get_rich_text_from_result(x, "blockId"): x.get("id") for x in results}
+    dict2 = {
+        get_rich_text_from_result(x, "blockId"): x.get("id")
+        for x in results
+        if is_exported_highlight(x)
+    }
     bookmarks = weread_api.get_bookmark_list(bookId)
     for i in bookmarks:
         if i.get("bookmarkId") in dict1:

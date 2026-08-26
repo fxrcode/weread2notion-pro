@@ -1,835 +1,344 @@
-import hashlib
 import logging
 import os
-import re
+import time
 from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
-from requests.utils import cookiejar_from_dict
-from retrying import retry
 
-# 配置日志 - 同时输出到控制台和文件
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
 log_dir = "logs"
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
-
+os.makedirs(log_dir, exist_ok=True)
 log_filename = os.path.join(
     log_dir, f"weread_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 )
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-# 创建logger
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
-# 创建formatter
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    file_handler = logging.FileHandler(log_filename, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.propagate = False
+    logger.info(f"日志文件已创建: {log_filename}")
 
-# 创建控制台handler
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(formatter)
 
-# 创建文件handler
-file_handler = logging.FileHandler(log_filename, encoding="utf-8")
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(formatter)
+GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
+SKILL_VERSION = "1.0.4"
 
-# 添加handlers到logger
-logger.addHandler(console_handler)
-logger.addHandler(file_handler)
 
-# 避免重复日志
-logger.propagate = False
-
-logger.info(f"日志文件已创建: {log_filename}")
-
-load_dotenv()
-WEREAD_URL = "https://weread.qq.com"
-WEREAD_NOTEBOOKS_URL = "https://weread.qq.com/api/user/notebook"
-WEREAD_BOOKMARKLIST_URL = "https://weread.qq.com/web/book/bookmarklist"
-WEREAD_CHAPTER_INFO = "https://weread.qq.com/web/book/chapterInfos"
-WEREAD_READ_INFO_URL = "https://weread.qq.com/web/book/getProgress"
-WEREAD_REVIEW_LIST_URL = "https://weread.qq.com/web/review/list"
-WEREAD_BOOK_INFO = "https://weread.qq.com/web/book/info"
-WEREAD_READDATA_DETAIL = "https://weread.qq.com/web/readdata/detail"
-WEREAD_HISTORY_URL = "https://weread.qq.com/web/readdata/summary?synckey=0"
+class WeReadApiError(RuntimeError):
+    """Raised when the official WeRead gateway rejects a request."""
 
 
 class WeReadApi:
-    def __init__(self):
-        self.cookie = self.get_cookie()
-        self.session = requests.Session()
-        self.session.cookies = self.parse_cookie_string()
+    def __init__(self, api_key=None, session=None):
+        self.api_key = api_key or os.getenv("WEREAD_API_KEY")
+        if not self.api_key or not self.api_key.strip():
+            raise WeReadApiError(
+                "没有找到 WEREAD_API_KEY，请从 "
+                "https://weread.qq.com/r/weread-skills 获取并配置"
+            )
+
+        self.session = session or requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/73.0.3683.103 Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
+                "Authorization": f"Bearer {self.api_key.strip()}",
+                "Accept": "application/json",
                 "Content-Type": "application/json",
+                "User-Agent": "weread2notion-pro",
             }
         )
+        self._book_urls = {}
 
-    def try_get_cloud_cookie(self, url, id, password):
-        if url.endswith("/"):
-            url = url[:-1]
-        req_url = f"{url}/get/{id}"
-        data = {"password": password}
-        result = None
-        response = requests.post(req_url, data=data)
-        if response.status_code == 200:
-            data = response.json()
-            cookie_data = data.get("cookie_data")
-            if cookie_data and "weread.qq.com" in cookie_data:
-                cookies = cookie_data["weread.qq.com"]
-                cookie_str = "; ".join(
-                    [f"{cookie['name']}={cookie['value']}" for cookie in cookies]
-                )
-                result = cookie_str
-        return result
+    @staticmethod
+    def _retry_delay(response, attempt):
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(float(retry_after), 0)
+            except (TypeError, ValueError):
+                # HTTP-date 格式无法直接换算时使用保守冷却时间。
+                return 60
+        if response.status_code in (429, 499):
+            # 官方网关目前按时间窗口限流且通常不返回 Retry-After。
+            return 60
+        return 2 ** (attempt + 1)
 
-    def get_cookie(self):
-        url = os.getenv("CC_URL")
-        if not url:
-            url = "https://cookiecloud.malinkang.com/"
-        id = os.getenv("CC_ID")
-        password = os.getenv("CC_PASSWORD")
-        cookie = os.getenv("WEREAD_COOKIE")
-        if url and id and password:
-            cookie = self.try_get_cloud_cookie(url, id, password)
-        if not cookie or not cookie.strip():
-            raise Exception("没有找到cookie，请按照文档填写cookie")
-        return cookie
+    def _request(self, api_name, **params):
+        payload = {
+            "api_name": api_name,
+            "skill_version": SKILL_VERSION,
+            **params,
+        }
+        logger.info(f"调用微信读书官方API: {api_name}")
+        data = None
+        for attempt in range(4):
+            try:
+                response = self.session.post(GATEWAY_URL, json=payload, timeout=30)
+            except requests.RequestException as exc:
+                if attempt < 3:
+                    time.sleep(2**attempt)
+                    continue
+                raise WeReadApiError(
+                    f"微信读书API请求失败 ({api_name}): {exc}"
+                ) from exc
 
-    def parse_cookie_string(self):
-        cookies_dict = {}
-
-        # 使用正则表达式解析 cookie 字符串
-        pattern = re.compile(r"([^=]+)=([^;]+);?\s*")
-        matches = pattern.findall(self.cookie)
-
-        for key, value in matches:
-            cookies_dict[key] = value.encode("unicode_escape").decode("ascii")
-        # 直接使用 cookies_dict 创建 cookiejar
-        cookiejar = cookiejar_from_dict(cookies_dict)
-
-        return cookiejar
-
-    def get_bookshelf(self, retry_count=0):
-        """获取书架信息"""
-        logger.info("正在获取书架信息...")
-        try:
-            url = "https://weread.qq.com/web/shelf/sync"
-            headers = dict(self.session.headers)
-            logger.info(f"请求URL: {url}")
-            logger.debug(f"请求头: {headers}")
-
-            self.session.get(WEREAD_URL)
-            r = self.session.get(url, headers=headers)
-            logger.info(f"书架API响应状态: {r.status_code}")
-            logger.debug(f"响应头: {dict(r.headers)}")
-
-            if r.ok:
-                data = r.json()
-                logger.info(
-                    f"书架API响应成功，数据键: {list(data.keys()) if data else 'None'}"
-                )
-                logger.debug(f"完整响应数据: {data}")
-
-                # 检查是否有错误码
-                if data.get("errCode") and data.get("errCode") != 0:
-                    logger.warning(
-                        f"API返回错误: {data.get('errMsg', '未知错误')} (错误码: {data.get('errCode')})"
-                    )
-                    if (
-                        data.get("errCode") == -2012 and retry_count == 0
-                    ):  # 登录超时，尝试刷新Cookie
-                        logger.info("获取书架信息 - 登录超时，尝试刷新Cookie后重试")
-                        if self.refresh_cookie():
-                            logger.info("获取书架信息 - Cookie刷新成功，重新请求")
-                            return self.get_bookshelf(retry_count + 1)
-                        else:
-                            logger.warning("获取书架信息 - Cookie刷新失败")
-                            return {"books": []}
-                    elif data.get("errCode") == -2012:
-                        logger.warning("获取书架信息 - 重试后仍登录超时")
-                        return {"books": []}
-                    self.handle_errcode(data.get("errCode", 0))
-                    return {"books": []}
-
-                # 根据实际响应结构获取书籍数据
-                books = data.get("books", [])
-                if not books and "info" in data:
-                    # 如果books为空，尝试从info中获取
-                    info = data.get("info", {})
-                    books = info.get("books", []) if isinstance(info, dict) else []
-
-                logger.info(f"获取到书架信息，包含 {len(books)} 本书")
-                if books:
-                    logger.debug(f"第一本书示例: {books[0] if books else 'None'}")
-                    # 记录前几本书的基本信息
-                    for i, book in enumerate(books[:5]):  # 只记录前5本书的信息
-                        book_title = book.get("title", "未知书名")
-                        book_id = book.get("bookId", "未知ID")
-                        book_author = book.get("author", "未知作者")
-                        logger.info(
-                            f"  书架书籍 {i + 1}: 《{book_title}》 作者: {book_author} (bookId: {book_id})"
-                        )
-                    if len(books) > 5:
-                        logger.info(f"  ... 还有 {len(books) - 5} 本书")
-                return {"books": books}
-            else:
-                logger.error(f"书架API响应失败: {r.status_code} - {r.text}")
-                logger.debug(f"错误响应内容: {r.text}")
-                errcode = r.json().get("errcode", 0) if r.text else 0
-                self.handle_errcode(errcode)
-                return {"books": []}
-        except Exception as e:
-            logger.error(f"获取书架信息时出错: {str(e)}")
-            import traceback
-
-            traceback.print_exc()
-            raise
-
-    def handle_errcode(self, errcode):
-        if errcode == -2012 or errcode == -2010:
-            logger.error(
-                "::error::微信读书Cookie过期了，请参考文档重新设置。https://mp.weixin.qq.com/s/B_mqLUZv7M1rmXRsMlBf7A"
-            )
-
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
-    def get_notebooklist(self, retry_count=0):
-        """获取笔记本列表"""
-        logger.info("正在获取笔记本列表...")
-        try:
-            headers = dict(self.session.headers)
-            logger.info(f"请求URL: {WEREAD_NOTEBOOKS_URL}")
-            logger.debug(f"请求头: {headers}")
-
-            self.session.get(WEREAD_URL)
-            r = self.session.get(WEREAD_NOTEBOOKS_URL, headers=headers)
-            logger.info(f"笔记本API响应状态: {r.status_code}")
-            logger.debug(f"响应头: {dict(r.headers)}")
-
-            if r.ok:
-                data = r.json()
-                logger.info(
-                    f"笔记本API响应数据键: {list(data.keys()) if data else 'None'}"
-                )
-                logger.debug(f"完整响应数据: {data}")
-
-                # 检查是否有错误码
-                if data.get("errCode") and data.get("errCode") != 0:
-                    logger.warning(
-                        f"API返回错误: {data.get('errMsg', '未知错误')} (错误码: {data.get('errCode')})"
-                    )
-                    if (
-                        data.get("errCode") == -2012 and retry_count == 0
-                    ):  # 登录超时，尝试刷新Cookie
-                        logger.info("获取笔记本列表 - 登录超时，尝试刷新Cookie后重试")
-                        if self.refresh_cookie():
-                            logger.info("获取笔记本列表 - Cookie刷新成功，重新请求")
-                            return self.get_notebooklist(retry_count + 1)
-                        else:
-                            logger.warning("获取笔记本列表 - Cookie刷新失败")
-                            return []
-                    elif data.get("errCode") == -2012:
-                        logger.warning("获取笔记本列表 - 重试后仍登录超时")
-                        return []
-                    self.handle_errcode(data.get("errCode", 0))
-                    return []
-
-                books = data.get("books")
-                if books:
-                    books.sort(key=lambda x: x["sort"])
-                    logger.info(f"获取到 {len(books)} 本有笔记的书")
-                    logger.debug(
-                        f"第一本有笔记的书示例: {books[0] if books else 'None'}"
-                    )
-
-                    # 为了保持与原有书架API的兼容性，将笔记本数据转换为书架格式
-                    # 提取book字段作为主要书籍信息，保持原有的数据结构
-                    formatted_books = []
-                    for notebook in books:
-                        if "book" in notebook:
-                            book_info = notebook["book"].copy()
-                            # 保留笔记本特有的信息
-                            book_info["noteCount"] = notebook.get("noteCount", 0)
-                            book_info["reviewCount"] = notebook.get("reviewCount", 0)
-                            book_info["sort"] = notebook.get("sort", 0)
-                            formatted_books.append(book_info)
-
-                    logger.debug(
-                        f"转换后的书籍格式示例: {formatted_books[0] if formatted_books else 'None'}"
-                    )
-                    return formatted_books
-                else:
-                    logger.warning("未获取到笔记本数据")
-                    return []
-            else:
-                logger.error(f"笔记本API响应失败: {r.status_code} - {r.text}")
-                logger.debug(f"错误响应内容: {r.text}")
-                errcode = r.json().get("errcode", 0) if r.text else 0
-                self.handle_errcode(errcode)
-                return []
-        except Exception as e:
-            logger.error(f"获取笔记本列表时出错: {str(e)}")
-            import traceback
-
-            traceback.print_exc()
-            raise
-
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
-    def get_bookinfo(self, bookId, retry_count=0):
-        """获取书的详情"""
-        headers = dict(self.session.headers)
-        logger.info(f"获取书籍信息 - 请求URL: {WEREAD_BOOK_INFO}")
-        logger.info(f"获取书籍信息 - 请求参数: bookId={bookId}")
-        logger.debug(f"获取书籍信息 - 请求头: {headers}")
-
-        self.session.get(WEREAD_URL)
-        params = dict(bookId=bookId)
-        r = self.session.get(WEREAD_BOOK_INFO, params=params, headers=headers)
-        logger.info(f"获取书籍信息 - 响应状态: {r.status_code}")
-        logger.debug(f"获取书籍信息 - 响应头: {dict(r.headers)}")
-
-        if r.ok:
-            data = r.json()
-            logger.info(f"获取书籍信息 - 完整原始响应: {data}")
-
-            # 检查是否有错误码
-            if data.get("errCode") and data.get("errCode") != 0:
-                logger.warning(
-                    f"获取书籍信息 - API返回错误: {data.get('errMsg', '未知错误')} (错误码: {data.get('errCode')})"
-                )
+            try:
+                data = response.json()
+            except ValueError as exc:
                 if (
-                    data.get("errCode") == -2012 and retry_count == 0
-                ):  # 登录超时，尝试刷新Cookie
-                    logger.info("获取书籍信息 - 登录超时，尝试刷新Cookie后重试")
-                    if self.refresh_cookie():
-                        logger.info("获取书籍信息 - Cookie刷新成功，重新请求")
-                        return self.get_bookinfo(bookId, retry_count + 1)
-                    else:
-                        logger.warning(
-                            f"获取书籍信息 - Cookie刷新失败，跳过书籍 {bookId}"
-                        )
-                        return None
-                elif data.get("errCode") == -2012:
+                    response.status_code in (429, 499)
+                    or response.status_code >= 500
+                ) and attempt < 3:
+                    delay = self._retry_delay(response, attempt)
                     logger.warning(
-                        f"获取书籍信息 - 重试后仍登录超时，跳过书籍 {bookId}"
+                        f"微信读书API暂时不可用 ({response.status_code})，"
+                        f"{delay:g}秒后重试"
                     )
-                    return None
-                self.handle_errcode(data.get("errCode", 0))
-                return None
+                    time.sleep(delay)
+                    continue
+                raise WeReadApiError(
+                    f"微信读书API返回了无效JSON ({api_name})"
+                ) from exc
 
-            # 记录获取到的书籍详细信息
-            book_title = data.get("title", "未知书名")
-            book_author = data.get("author", "未知作者")
-            logger.info(
-                f"获取书籍信息 - 成功获取书籍: 《{book_title}》 作者: {book_author} (bookId: {bookId})"
-            )
-            logger.debug(
-                f"获取书籍信息 - 书籍详细信息: title={book_title}, author={book_author}, cover={data.get('cover', 'None')}, isbn={data.get('isbn', 'None')}"
-            )
+            if response.status_code < 400:
+                break
 
-            return data
+            if response.status_code in (429, 499) or response.status_code >= 500:
+                if attempt < 3:
+                    delay = self._retry_delay(response, attempt)
+                    logger.warning(
+                        f"微信读书API暂时不可用 ({response.status_code})，"
+                        f"{delay:g}秒后重试"
+                    )
+                    time.sleep(delay)
+                    continue
+
+            errmsg = (
+                data.get("errmsg", data.get("errMsg"))
+                if isinstance(data, dict)
+                else None
+            )
+            detail = f": {errmsg}" if errmsg else ""
+            raise WeReadApiError(
+                f"微信读书API HTTP错误 ({api_name}): "
+                f"{response.status_code}{detail}"
+            )
         else:
-            logger.error(f"获取书籍信息 - 请求失败: {r.status_code} - {r.text}")
-            errcode = r.json().get("errcode", 0) if r.text else 0
-            self.handle_errcode(errcode)
+            raise WeReadApiError(f"微信读书API重试失败 ({api_name})")
+
+        if not isinstance(data, dict):
+            raise WeReadApiError(f"微信读书API返回格式异常 ({api_name})")
+
+        upgrade_info = data.get("upgrade_info")
+        if upgrade_info:
+            message = (
+                upgrade_info.get("message")
+                if isinstance(upgrade_info, dict)
+                else str(upgrade_info)
+            )
+            raise WeReadApiError(
+                f"微信读书API要求升级 Skill（当前 {SKILL_VERSION}）: {message}"
+            )
+
+        errcode = data.get("errcode", data.get("errCode", 0))
+        if errcode:
+            errmsg = data.get("errmsg", data.get("errMsg", "未知错误"))
+            raise WeReadApiError(
+                f"微信读书API返回错误 ({api_name}): {errmsg} (错误码: {errcode})"
+            )
+
+        return data
+
+    def get_bookshelf(self):
+        """获取完整电子书书架。"""
+        data = self._request("/shelf/sync")
+        books = data.get("books") or []
+        self._book_urls.update(
+            {
+                book["bookId"]: book["deepLink"]
+                for book in books
+                if book.get("bookId") and book.get("deepLink")
+            }
+        )
+        logger.info(f"获取到书架信息，包含 {len(books)} 本电子书")
+        return data
+
+    def get_notebooklist(self):
+        """获取全部笔记本，兼容现有同步器需要的扁平书籍结构。"""
+        notebooks = []
+        last_sort = None
+        seen_cursors = set()
+
+        while True:
+            params = {"count": 100}
+            if last_sort is not None:
+                params["lastSort"] = last_sort
+            data = self._request("/user/notebooks", **params)
+            page = data.get("books") or []
+            notebooks.extend(page)
+
+            if not data.get("hasMore") or not page:
+                break
+
+            next_cursor = page[-1].get("sort")
+            if next_cursor is None or next_cursor in seen_cursors:
+                raise WeReadApiError("微信读书笔记本分页游标无效，已停止以避免重复同步")
+            seen_cursors.add(next_cursor)
+            last_sort = next_cursor
+            time.sleep(0.2)
+
+        formatted_books = []
+        for notebook in notebooks:
+            book_info = (notebook.get("book") or {}).copy()
+            book_id = notebook.get("bookId") or book_info.get("bookId")
+            if not book_id:
+                continue
+            book_info.update(
+                {
+                    "bookId": book_id,
+                    "noteCount": notebook.get("noteCount", 0),
+                    "reviewCount": notebook.get("reviewCount", 0),
+                    "bookmarkCount": notebook.get("bookmarkCount", 0),
+                    "readingProgress": notebook.get("readingProgress", 0),
+                    "markedStatus": notebook.get("markedStatus", 0),
+                    "sort": notebook.get("sort", 0),
+                }
+            )
+            if book_info.get("deepLink"):
+                self._book_urls[book_id] = book_info["deepLink"]
+            formatted_books.append(book_info)
+
+        # 先处理旧笔记；中途失败时不会越过尚未同步的较旧记录。
+        formatted_books.sort(key=lambda book: book.get("sort", 0))
+        logger.info(f"获取到 {len(formatted_books)} 本有笔记的书")
+        return formatted_books
+
+    def get_bookinfo(self, bookId):
+        data = self._request("/book/info", bookId=str(bookId))
+        if data.get("deepLink"):
+            self._book_urls[str(bookId)] = data["deepLink"]
+        return data
+
+    def get_bookmark_list(self, bookId):
+        data = self._request("/book/bookmarklist", bookId=str(bookId))
+        bookmarks = data.get("updated") or []
+        logger.info(f"获取到 {len(bookmarks)} 个划线")
+        return bookmarks
+
+    def get_review_list(self, bookId):
+        reviews = []
+        synckey = 0
+        seen_cursors = set()
+
+        while True:
+            data = self._request(
+                "/review/list/mine",
+                bookid=str(bookId),
+                synckey=synckey,
+                count=100,
+            )
+            page = data.get("reviews") or []
+            for item in page:
+                review = item.get("review", item)
+                if not isinstance(review, dict):
+                    continue
+                if review.get("type") == 4:
+                    review = {"chapterUid": 1000000, **review}
+                reviews.append(review)
+
+            if not data.get("hasMore"):
+                break
+
+            next_cursor = data.get("synckey")
+            if next_cursor is None or next_cursor in seen_cursors:
+                raise WeReadApiError("微信读书想法分页游标无效，已停止以避免重复同步")
+            seen_cursors.add(next_cursor)
+            synckey = next_cursor
+
+        logger.info(f"获取到 {len(reviews)} 个想法")
+        return reviews
+
+    def get_chapter_info(self, bookId):
+        data = self._request("/book/chapterinfo", bookId=str(bookId))
+        chapters = data.get("chapters") or []
+        if not chapters:
+            logger.warning(f"书籍 {bookId} 未返回章节信息，保留现有章节数据")
             return None
-
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
-    def get_bookmark_list(self, bookId, retry_count=0):
-        headers = dict(self.session.headers)
-        logger.info(f"获取标注列表 - 请求URL: {WEREAD_BOOKMARKLIST_URL}")
-        logger.info(f"获取标注列表 - 请求参数: bookId={bookId}")
-        logger.debug(f"获取标注列表 - 请求头: {headers}")
-
-        self.session.get(WEREAD_URL)
-        params = dict(bookId=bookId)
-        r = self.session.get(WEREAD_BOOKMARKLIST_URL, params=params, headers=headers)
-        logger.info(f"获取标注列表 - 响应状态: {r.status_code}")
-        logger.debug(f"获取标注列表 - 响应头: {dict(r.headers)}")
-
-        if r.ok:
-            data = r.json()
-            logger.info(
-                f"获取标注列表 - 响应数据键: {list(data.keys()) if data else 'None'}"
-            )
-            logger.debug(f"获取标注列表 - 完整响应: {data}")
-
-            # 检查是否有错误码
-            if data.get("errCode") and data.get("errCode") != 0:
-                logger.warning(
-                    f"获取标注列表 - API返回错误: {data.get('errMsg', '未知错误')} (错误码: {data.get('errCode')})"
-                )
-                if (
-                    data.get("errCode") == -2012 and retry_count == 0
-                ):  # 登录超时，尝试刷新Cookie
-                    logger.info("获取标注列表 - 登录超时，尝试刷新Cookie后重试")
-                    if self.refresh_cookie():
-                        logger.info("获取标注列表 - Cookie刷新成功，重新请求")
-                        return self.get_bookmark_list(bookId, retry_count + 1)
-                    else:
-                        logger.warning(
-                            f"获取标注列表 - Cookie刷新失败，跳过书籍 {bookId}"
-                        )
-                        return []
-                elif data.get("errCode") == -2012:
-                    logger.warning(
-                        f"获取标注列表 - 重试后仍登录超时，跳过书籍 {bookId}"
-                    )
-                    return []
-                self.handle_errcode(data.get("errCode", 0))
-                return []
-
-            bookmarks = data.get("updated", [])
-            logger.info(f"获取到 {len(bookmarks)} 个标注")
-            return bookmarks
-        else:
-            logger.error(f"获取标注列表 - 请求失败: {r.status_code} - {r.text}")
-            errcode = r.json().get("errcode", 0) if r.text else 0
-            self.handle_errcode(errcode)
-            return []
-
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
-    def get_read_info(self, bookId, retry_count=0):
-        # 构建请求头，模仿TypeScript版本的实现
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/73.0.3683.103 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
+        chapters.append(
+            {
+                "chapterUid": 1000000,
+                "chapterIdx": 1000000,
+                "updateTime": 1683825006,
+                "readAhead": 0,
+                "title": "点评",
+                "level": 1,
+            }
+        )
+        logger.info(f"获取到 {len(chapters)} 个章节信息")
+        return {
+            chapter["chapterUid"]: chapter
+            for chapter in chapters
+            if chapter.get("chapterUid") is not None
         }
 
-        logger.info(f"获取阅读信息 - 请求URL: {WEREAD_READ_INFO_URL}")
-        logger.info(f"获取阅读信息 - 请求参数: bookId={bookId}")
-        logger.debug(f"获取阅读信息 - 请求头: {headers}")
+    def get_read_info(self, bookId):
+        data = self._request("/book/getprogress", bookId=str(bookId))
+        book_data = data.get("book") or {}
+        progress = book_data.get("progress", 0)
+        reading_time = book_data.get(
+            "recordReadingTime", book_data.get("readingTime", 0)
+        )
 
-        try:
-            # 直接请求API，不先访问主页，模仿TypeScript版本
-            params = {"bookId": bookId}
-            logger.info(f"获取阅读信息 - 发起请求，参数: {params}")
-            # 避免Cookie冲突，只记录Cookie数量
-            try:
-                cookie_count = len(list(self.session.cookies))
-                logger.debug(f"获取阅读信息 - 请求cookies数量: {cookie_count}")
-            except Exception as e:
-                logger.debug(f"获取阅读信息 - 无法获取cookies信息: {str(e)}")
-
-            r = requests.get(
-                WEREAD_READ_INFO_URL,
-                params=params,
-                headers=headers,
-                cookies=self.session.cookies,
-                timeout=30,
-            )
-            logger.info(f"获取阅读信息 - 响应状态: {r.status_code}")
-            logger.debug(f"获取阅读信息 - 响应头: {dict(r.headers)}")
-            logger.debug(
-                f"获取阅读信息 - 响应内容预览: {r.text[:500] if r.text else 'None'}..."
-            )
-
-            if r.ok:
-                data = r.json()
-                logger.info(f"获取阅读信息 - 完整原始响应: {data}")
-
-                # 检查是否有错误码
-                if data.get("errCode") and data.get("errCode") != 0:
-                    logger.warning(
-                        f"获取阅读信息 - API返回错误: {data.get('errMsg', '未知错误')} (错误码: {data.get('errCode')})"
-                    )
-                    if (
-                        data.get("errCode") == -2012 and retry_count == 0
-                    ):  # 登录超时，尝试刷新Cookie
-                        logger.info("获取阅读信息 - 登录超时，尝试刷新Cookie后重试")
-                        # 避免Cookie冲突，只记录Cookie数量
-                        try:
-                            cookie_count = len(list(self.session.cookies))
-                            logger.debug(
-                                f"获取阅读信息 - 当前cookies数量: {cookie_count}"
-                            )
-                        except Exception as e:
-                            logger.debug(
-                                f"获取阅读信息 - 无法获取当前cookies信息: {str(e)}"
-                            )
-
-                        if self.refresh_cookie():
-                            logger.info("获取阅读信息 - Cookie刷新成功，重新请求")
-                            try:
-                                cookie_count = len(list(self.session.cookies))
-                                logger.debug(
-                                    f"获取阅读信息 - 刷新后cookies数量: {cookie_count}"
-                                )
-                            except Exception as e:
-                                logger.debug(
-                                    f"获取阅读信息 - 无法获取刷新后cookies信息: {str(e)}"
-                                )
-                            return self.get_read_info(bookId, retry_count + 1)
-                        else:
-                            logger.warning(
-                                f"获取阅读信息 - Cookie刷新失败，跳过书籍 {bookId}"
-                            )
-                            return None
-                    elif data.get("errCode") == -2012:
-                        logger.warning(
-                            f"获取阅读信息 - 重试后仍登录超时，跳过书籍 {bookId}"
-                        )
-                        return None
-                    self.handle_errcode(data.get("errCode", 0))
-                    return None
-
-                # 根据book.py中实际使用的字段进行适配
-                result = {}
-
-                # 基础标识字段
-                result["bookId"] = bookId
-                result["canFreeRead"] = data.get("canFreeRead")
-                result["timestamp"] = data.get("timestamp")
-
-                # book.py中实际使用的核心字段
-                result["readingTime"] = data.get(
-                    "readingTime", 0
-                )  # 阅读时长（秒）- 用于计算"阅读时长"和"阅读状态"
-                result["progress"] = data.get("progress", 0)  # 阅读进度（0-100）
-                result["readingProgress"] = data.get(
-                    "progress", 0
-                )  # 兼容字段，用于计算"阅读进度"
-
-                # book.py中期望但API可能不返回的字段（设置默认值）
-                result["markedStatus"] = data.get(
-                    "markedStatus", 1
-                )  # 阅读状态标记：1-想读，4-读完，其他-在读
-                result["totalReadDay"] = data.get("totalReadDay", 0)  # 阅读天数
-                result["newRating"] = data.get("newRating")  # 评分
-                result["newRatingDetail"] = data.get("newRatingDetail")  # 评分详情
-
-                # 获取嵌套的book对象数据
-                book_data = data.get("book", {})
-
-                # 时间相关字段（优先从book对象中获取，然后从顶级对象获取）
-                result["finishedDate"] = book_data.get("finishedDate") or data.get(
-                    "finishedDate"
-                )  # 完成日期
-                result["lastReadingDate"] = book_data.get(
-                    "lastReadingDate"
-                ) or data.get("lastReadingDate")  # 最后阅读日期
-                result["readingBookDate"] = book_data.get(
-                    "readingBookDate"
-                ) or data.get("readingBookDate")  # 阅读书籍日期
-                result["beginReadingDate"] = book_data.get(
-                    "beginReadingDate"
-                ) or data.get("beginReadingDate")  # 开始阅读日期
-                result["startReadingTime"] = book_data.get(
-                    "startReadingTime"
-                ) or data.get("startReadingTime")  # 开始阅读时间戳
-                result["finishTime"] = book_data.get("finishTime") or data.get(
-                    "finishTime"
-                )  # 完成时间戳
-                result["updateTime"] = book_data.get("updateTime") or data.get(
-                    "updateTime"
-                )  # 更新时间
-
-                # 从book对象中提取其他重要字段
-                if book_data:
-                    # 覆盖之前设置的字段，使用book对象中的实际数据
-                    result["readingTime"] = book_data.get(
-                        "readingTime", result.get("readingTime", 0)
-                    )
-                    result["progress"] = book_data.get(
-                        "progress", result.get("progress", 0)
-                    )
-                    result["readingProgress"] = book_data.get(
-                        "progress", result.get("readingProgress", 0)
-                    )
-                    result["chapterUid"] = book_data.get("chapterUid")
-                    result["chapterOffset"] = book_data.get("chapterOffset")
-                    result["chapterIdx"] = book_data.get("chapterIdx")
-                    result["isStartReading"] = book_data.get("isStartReading")
-
-                # 阅读详情数据（用于插入阅读时间数据）
-                result["readDetail"] = data.get("readDetail", {})
-
-                # 书籍信息（可能包含额外的书籍元数据）
-                result["bookInfo"] = data.get("bookInfo", {})
-
-                # 保留原始数据以保持完整性和向后兼容
-                result["book"] = book_data
-
-                # 记录获取到的阅读信息详情
-                reading_time = result.get("readingTime", 0)
-                progress = result.get("progress", 0)
-                start_reading_time = result.get("startReadingTime")
-                update_time = result.get("updateTime")
-
-                # 获取书籍名称用于日志显示
-                book_title = book_data.get("title") or data.get("title")
-                book_author = book_data.get("author") or data.get("author")
-
-                # 如果阅读信息API没有返回书名，尝试从书籍详情API获取
-                if not book_title or not book_author:
-                    logger.debug(
-                        f"获取阅读信息 - 阅读信息API未返回书名，尝试从书籍详情API获取 (bookId: {bookId})"
-                    )
-                    try:
-                        book_info = self.get_bookinfo(bookId)
-                        if book_info:
-                            book_title = book_title or book_info.get(
-                                "title", "未知书名"
-                            )
-                            book_author = book_author or book_info.get(
-                                "author", "未知作者"
-                            )
-                            logger.debug(
-                                f"获取阅读信息 - 从书籍详情API获取到书名: {book_title}, 作者: {book_author}"
-                            )
-                        else:
-                            book_title = book_title or "未知书名"
-                            book_author = book_author or "未知作者"
-                            logger.warning(
-                                f"获取阅读信息 - 无法从书籍详情API获取书名 (bookId: {bookId})"
-                            )
-                    except Exception as e:
-                        book_title = book_title or "未知书名"
-                        book_author = book_author or "未知作者"
-                        logger.warning(
-                            f"获取阅读信息 - 获取书籍详情时发生异常: {str(e)} (bookId: {bookId})"
-                        )
-                else:
-                    book_title = book_title or "未知书名"
-                    book_author = book_author or "未知作者"
-
-                logger.info(
-                    f"获取阅读信息 - 成功获取书籍《{book_title}》(作者: {book_author}) 的阅读信息 (bookId: {bookId})"
-                )
-                logger.info(
-                    f"获取阅读信息 - 阅读详情: 阅读时长={reading_time}秒, 进度={progress}%, 开始阅读时间戳={start_reading_time}, 更新时间戳={update_time}"
-                )
-                logger.info(
-                    f"获取阅读信息 - 时间字段详情: finishedDate={result.get('finishedDate')}, lastReadingDate={result.get('lastReadingDate')}, beginReadingDate={result.get('beginReadingDate')}"
-                )
-                logger.debug(f"获取阅读信息 - 最终返回数据: {result}")
-                return result
-            else:
-                logger.error(f"获取阅读信息 - 请求失败: {r.status_code} - {r.text}")
-                logger.debug(f"获取阅读信息 - 失败响应头: {dict(r.headers)}")
-                try:
-                    errcode = r.json().get("errcode", 0) if r.text else 0
-                except:
-                    errcode = 0
-                self.handle_errcode(errcode)
-                return None
-
-        except Exception as e:
-            logger.error(f"获取阅读信息 - 请求异常: {str(e)}")
-            import traceback
-
-            logger.error(f"获取阅读信息 - 异常堆栈: {traceback.format_exc()}")
-            return None
-
-    def refresh_cookie(self):
-        """刷新Cookie，模仿TypeScript版本的实现"""
-        try:
-            logger.info("尝试刷新Cookie...")
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/73.0.3683.103 Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Content-Type": "application/json",
-            }
-
-            # 发送HEAD请求到主页
-            r = requests.head(
-                WEREAD_URL, headers=headers, cookies=self.session.cookies, timeout=30
-            )
-
-            # 检查是否有新的Cookie
-            if "Set-Cookie" in r.headers:
-                logger.info("收到新的Cookie，更新session")
-                # 更新session的cookies
-                for cookie in r.cookies:
-                    self.session.cookies.set(cookie.name, cookie.value)
-                return True
-            else:
-                logger.warning("未收到新的Cookie")
-                return False
-
-        except Exception as e:
-            logger.error(f"刷新Cookie失败: {str(e)}")
-            return False
-
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
-    def get_review_list(self, bookId):
-        headers = dict(self.session.headers)
-        logger.info(f"获取想法列表 - 请求URL: {WEREAD_REVIEW_LIST_URL}")
-        logger.info(f"获取想法列表 - 请求参数: bookId={bookId}")
-        logger.debug(f"获取想法列表 - 请求头: {headers}")
-
-        self.session.get(WEREAD_URL)
-        params = dict(bookId=bookId, listType=11, mine=1, synckey=0)
-        r = self.session.get(WEREAD_REVIEW_LIST_URL, params=params, headers=headers)
-        logger.info(f"获取想法列表 - 响应状态: {r.status_code}")
-        logger.debug(f"获取想法列表 - 响应头: {dict(r.headers)}")
-
-        if r.ok:
-            data = r.json()
-            logger.info(
-                f"获取想法列表 - 响应数据键: {list(data.keys()) if data else 'None'}"
-            )
-            logger.debug(f"获取想法列表 - 完整响应: {data}")
-
-            # 检查是否有错误码
-            if data.get("errCode") and data.get("errCode") != 0:
-                logger.warning(
-                    f"获取想法列表 - API返回错误: {data.get('errMsg', '未知错误')} (错误码: {data.get('errCode')})"
-                )
-                if data.get("errCode") == -2012:  # 登录超时
-                    logger.warning(f"获取想法列表 - 登录超时，跳过书籍 {bookId}")
-                    return []
-                self.handle_errcode(data.get("errCode", 0))
-                return []
-
-            reviews = data.get("reviews", [])
-            if reviews:
-                reviews = list(map(lambda x: x.get("review"), reviews))
-                reviews = [
-                    {"chapterUid": 1000000, **x} if x.get("type") == 4 else x
-                    for x in reviews
-                ]
-            logger.info(f"获取到 {len(reviews)} 个想法")
-            return reviews
-        else:
-            logger.error(f"获取想法列表 - 请求失败: {r.status_code} - {r.text}")
-            errcode = r.json().get("errcode", 0) if r.text else 0
-            self.handle_errcode(errcode)
-            return []
-
-    def get_api_data(self):
-        headers = dict(self.session.headers)
-        logger.info(f"获取历史数据 - 请求URL: {WEREAD_HISTORY_URL}")
-        logger.debug(f"获取历史数据 - 请求头: {headers}")
-
-        self.session.get(WEREAD_URL)
-        r = self.session.get(WEREAD_HISTORY_URL, headers=headers)
-        logger.info(f"获取历史数据 - 响应状态: {r.status_code}")
-        logger.debug(f"获取历史数据 - 响应头: {dict(r.headers)}")
-
-        if r.ok:
-            data = r.json()
-            logger.info(
-                f"获取历史数据 - 响应数据键: {list(data.keys()) if data else 'None'}"
-            )
-            logger.debug(f"获取历史数据 - 完整响应: {data}")
-
-            # 检查是否有错误码
-            if data.get("errCode") and data.get("errCode") != 0:
-                logger.warning(
-                    f"获取历史数据 - API返回错误: {data.get('errMsg', '未知错误')} (错误码: {data.get('errCode')})"
-                )
-                self.handle_errcode(data.get("errCode", 0))
-                return None
-
-            return data
-        else:
-            logger.error(f"获取历史数据 - 请求失败: {r.status_code} - {r.text}")
-            errcode = r.json().get("errcode", 0) if r.text else 0
-            self.handle_errcode(errcode)
-            return None
-
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
-    def get_chapter_info(self, bookId):
-        headers = dict(self.session.headers)
-        logger.info(f"获取章节信息 - 请求URL: {WEREAD_CHAPTER_INFO}")
-        logger.info(f"获取章节信息 - 请求参数: bookId={bookId}")
-        logger.debug(f"获取章节信息 - 请求头: {headers}")
-
-        self.session.get(WEREAD_URL)
-        body = {"bookIds": [bookId], "synckeys": [0], "teenmode": 0}
-        r = self.session.post(WEREAD_CHAPTER_INFO, json=body, headers=headers)
-        logger.info(f"获取章节信息 - 响应状态: {r.status_code}")
-        logger.debug(f"获取章节信息 - 响应头: {dict(r.headers)}")
-
-        if r.ok:
-            data = r.json()
-            logger.info(
-                f"获取章节信息 - 响应数据键: {list(data.keys()) if data else 'None'}"
-            )
-            logger.debug(f"获取章节信息 - 完整响应: {data}")
-
-            # 检查是否有错误码
-            if data.get("errCode") and data.get("errCode") != 0:
-                logger.warning(
-                    f"获取章节信息 - API返回错误: {data.get('errMsg', '未知错误')} (错误码: {data.get('errCode')})"
-                )
-                if data.get("errCode") == -2012:  # 登录超时
-                    logger.warning(f"获取章节信息 - 登录超时，跳过书籍 {bookId}")
-                    return None
-                self.handle_errcode(data.get("errCode", 0))
-                return None
-
-            if (
-                "data" in data
-                and len(data["data"]) == 1
-                and "updated" in data["data"][0]
-            ):
-                update = data["data"][0]["updated"]
-                update.append(
-                    {
-                        "chapterUid": 1000000,
-                        "chapterIdx": 1000000,
-                        "updateTime": 1683825006,
-                        "readAhead": 0,
-                        "title": "点评",
-                        "level": 1,
-                    }
-                )
-                logger.info(f"获取到 {len(update)} 个章节信息")
-                return {item["chapterUid"]: item for item in update}
-            else:
-                logger.warning("获取章节信息 - 响应数据格式异常")
-                return None
-        else:
-            logger.error(f"获取章节信息 - 请求失败: {r.status_code} - {r.text}")
-            errcode = r.json().get("errcode", 0) if r.text else 0
-            self.handle_errcode(errcode)
-            return None
-
-    def transform_id(self, book_id):
-        id_length = len(book_id)
-        if re.match("^\\d*$", book_id):
-            ary = []
-            for i in range(0, id_length, 9):
-                ary.append(format(int(book_id[i : min(i + 9, id_length)]), "x"))
-            return "3", ary
-
-        result = ""
-        for i in range(id_length):
-            result += format(ord(book_id[i]), "x")
-        return "4", [result]
-
-    def calculate_book_str_id(self, book_id):
-        md5 = hashlib.md5()
-        md5.update(book_id.encode("utf-8"))
-        digest = md5.hexdigest()
-        result = digest[0:3]
-        code, transformed_ids = self.transform_id(book_id)
-        result += code + "2" + digest[-2:]
-
-        for i in range(len(transformed_ids)):
-            hex_length_str = format(len(transformed_ids[i]), "x")
-            if len(hex_length_str) == 1:
-                hex_length_str = "0" + hex_length_str
-
-            result += hex_length_str + transformed_ids[i]
-
-            if i < len(transformed_ids) - 1:
-                result += "g"
-
-        if len(result) < 20:
-            result += digest[0 : 20 - len(result)]
-
-        md5 = hashlib.md5()
-        md5.update(result.encode("utf-8"))
-        result += md5.hexdigest()[0:3]
+        result = {
+            "bookId": str(bookId),
+            "timestamp": data.get("timestamp"),
+            "readingTime": reading_time,
+            "progress": progress,
+            "readingProgress": progress,
+            "markedStatus": (
+                4 if progress >= 100 or book_data.get("finishTime") else 1
+            ),
+            "totalReadDay": data.get("readDays", 0),
+            "startReadingTime": book_data.get("startReadingTime"),
+            "finishedDate": book_data.get("finishTime"),
+            "finishTime": book_data.get("finishTime"),
+            "lastReadingDate": book_data.get("updateTime"),
+            "updateTime": book_data.get("updateTime"),
+            "chapterUid": book_data.get("chapterUid"),
+            "chapterOffset": book_data.get("chapterOffset"),
+            "isStartReading": book_data.get("isStartReading"),
+            "readDetail": data.get("readDetail", {}),
+            "bookInfo": data.get("bookInfo", {}),
+            "book": book_data,
+        }
+        logger.info(
+            f"获取阅读进度: bookId={bookId}, 进度={progress}%, "
+            f"阅读时长={reading_time}秒"
+        )
         return result
 
+    def get_api_data(self):
+        """获取本年度逐日阅读数据，供阅读热力图同步使用。"""
+        data = self._request("/readdata/detail", mode="annually", baseTime=0)
+        if data.get("dailyReadTimes") is not None:
+            data["readTimes"] = data["dailyReadTimes"]
+        else:
+            data.setdefault("readTimes", {})
+        return data
+
     def get_url(self, book_id):
-        return f"https://weread.qq.com/web/reader/{self.calculate_book_str_id(book_id)}"
+        book_id = str(book_id)
+        if book_id not in self._book_urls:
+            info = self.get_bookinfo(book_id)
+            if info.get("deepLink"):
+                self._book_urls[book_id] = info["deepLink"]
+        return self._book_urls.get(book_id)

@@ -212,7 +212,6 @@ class NotionHelper:
             "标题": {"title": {}},
             "NotinToken": {"rich_text": {}},
             "NotinPage": {"rich_text": {}},
-            "WeReadCookie": {"rich_text": {}},
             "根据划线颜色设置文字颜色": {"checkbox": {}},
             "同步书签": {"checkbox": {}},
             # "Cookie状态": {
@@ -262,11 +261,6 @@ class NotionHelper:
             "NotinPage": {
                 "rich_text": [
                     {"type": "text", "text": {"content": os.getenv("NOTION_PAGE")}}
-                ]
-            },
-            "WeReadCookie": {
-                "rich_text": [
-                    {"type": "text", "text": {"content": os.getenv("WEREAD_COOKIE")}}
                 ]
             },
         }
@@ -501,6 +495,9 @@ class NotionHelper:
                 ),
                 "comment": get_property_value(result.get("properties").get("豆瓣短评")),
                 "status": get_property_value(result.get("properties").get("阅读状态")),
+                "lastReadingTime": get_property_value(
+                    result.get("properties").get("最后阅读时间")
+                ),
             }
         return books_dict
 
