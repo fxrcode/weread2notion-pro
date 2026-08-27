@@ -1,197 +1,47 @@
 import logging
-import os
 import time
-from datetime import datetime
 
-import requests
-from dotenv import load_dotenv
-
-load_dotenv()
+from weread2notionpro.weread_gateway import (
+    GATEWAY_URL,
+    SKILL_VERSION,
+    WeReadApiError,
+    WeReadApiRateLimitError,
+    WeReadGateway,
+)
 
 logger = logging.getLogger(__name__)
 
-log_dir = "logs"
-os.makedirs(log_dir, exist_ok=True)
-log_filename = os.path.join(
-    log_dir, f"weread_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-)
-if not logger.handlers:
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+NOTEBOOK_PAGE_SIZE = 300
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    file_handler = logging.FileHandler(log_filename, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    logger.propagate = False
-    logger.info(f"日志文件已创建: {log_filename}")
-
-
-GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
-SKILL_VERSION = "1.0.4"
-
-
-class WeReadApiError(RuntimeError):
-    """Raised when the official WeRead gateway rejects a request."""
-
-
-class WeReadApiRateLimitError(WeReadApiError):
-    """Raised when requests must stop until the gateway quota resets."""
+__all__ = [
+    "GATEWAY_URL",
+    "NOTEBOOK_PAGE_SIZE",
+    "SKILL_VERSION",
+    "WeReadApi",
+    "WeReadApiError",
+    "WeReadApiRateLimitError",
+]
 
 
 class WeReadApi:
-    def __init__(self, api_key=None, session=None):
-        self.api_key = api_key or os.getenv("WEREAD_API_KEY")
-        if not self.api_key or not self.api_key.strip():
-            raise WeReadApiError(
-                "没有找到 WEREAD_API_KEY，请从 "
-                "https://weread.qq.com/r/weread-skills 获取并配置"
-            )
+    """Normalized WeRead domain client backed by the official Agent API."""
 
-        self.session = session or requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {self.api_key.strip()}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": "weread2notion-pro",
-            }
+    def __init__(self, api_key=None, session=None, gateway=None, sleep=None):
+        if gateway is not None and (api_key is not None or session is not None):
+            raise ValueError("提供 gateway 时不能同时提供 api_key 或 session")
+        self.gateway = gateway or WeReadGateway(
+            api_key=api_key,
+            session=session,
+            sleep=sleep,
         )
+        self.sleep = sleep or getattr(self.gateway, "sleep", time.sleep)
+        # Preserve these attributes for existing integrations and tests.
+        self.api_key = self.gateway.api_key
+        self.session = self.gateway.session
         self._book_urls = {}
 
-    @staticmethod
-    def _retry_delay(response, attempt):
-        retry_after = response.headers.get("Retry-After")
-        if retry_after:
-            try:
-                return max(float(retry_after), 0)
-            except (TypeError, ValueError):
-                # HTTP-date 格式无法直接换算时使用保守冷却时间。
-                return 60
-        if response.status_code in (429, 499):
-            # 官方网关目前按时间窗口限流且通常不返回 Retry-After。
-            return 60
-        return 2 ** (attempt + 1)
-
     def _request(self, api_name, **params):
-        payload = {
-            "api_name": api_name,
-            "skill_version": SKILL_VERSION,
-            **params,
-        }
-        logger.info(f"调用微信读书官方API: {api_name}")
-        data = None
-        for attempt in range(4):
-            try:
-                response = self.session.post(GATEWAY_URL, json=payload, timeout=30)
-            except requests.RequestException as exc:
-                if attempt < 3:
-                    time.sleep(2**attempt)
-                    continue
-                raise WeReadApiError(
-                    f"微信读书API请求失败 ({api_name}): {exc}"
-                ) from exc
-
-            try:
-                data = response.json()
-            except ValueError as exc:
-                if (
-                    response.status_code in (429, 499)
-                    or response.status_code >= 500
-                ) and attempt < 3:
-                    delay = self._retry_delay(response, attempt)
-                    logger.warning(
-                        f"微信读书API暂时不可用 ({response.status_code})，"
-                        f"{delay:g}秒后重试"
-                    )
-                    time.sleep(delay)
-                    continue
-                error = (
-                    f"微信读书API返回了无效JSON ({api_name})，"
-                    f"HTTP状态码: {response.status_code}"
-                )
-                logger.error(error)
-                error_type = (
-                    WeReadApiRateLimitError
-                    if response.status_code in (403, 429, 499)
-                    else WeReadApiError
-                )
-                raise error_type(error) from exc
-
-            if response.status_code < 400:
-                break
-
-            if response.status_code in (429, 499) or response.status_code >= 500:
-                if attempt < 3:
-                    delay = self._retry_delay(response, attempt)
-                    logger.warning(
-                        f"微信读书API暂时不可用 ({response.status_code})，"
-                        f"{delay:g}秒后重试"
-                    )
-                    time.sleep(delay)
-                    continue
-
-            errmsg = (
-                data.get("errmsg", data.get("errMsg"))
-                if isinstance(data, dict)
-                else None
-            )
-            detail = f": {errmsg}" if errmsg else ""
-            error = (
-                f"微信读书API HTTP错误 ({api_name}): "
-                f"{response.status_code}{detail}"
-            )
-            logger.error(error)
-            error_type = (
-                WeReadApiRateLimitError
-                if response.status_code in (403, 429, 499)
-                else WeReadApiError
-            )
-            raise error_type(error)
-        else:
-            raise WeReadApiError(f"微信读书API重试失败 ({api_name})")
-
-        if not isinstance(data, dict):
-            raise WeReadApiError(f"微信读书API返回格式异常 ({api_name})")
-
-        upgrade_info = data.get("upgrade_info")
-        if upgrade_info:
-            message = (
-                upgrade_info.get("message")
-                if isinstance(upgrade_info, dict)
-                else str(upgrade_info)
-            )
-            raise WeReadApiError(
-                f"微信读书API要求升级 Skill（当前 {SKILL_VERSION}）: {message}"
-            )
-
-        errcode = data.get("errcode", data.get("errCode", 0))
-        if errcode:
-            errmsg = data.get("errmsg", data.get("errMsg", "未知错误"))
-            error = (
-                f"微信读书API返回错误 ({api_name}): {errmsg} (错误码: {errcode})"
-            )
-            logger.error(error)
-            normalized_message = str(errmsg).lower()
-            is_rate_limit = any(
-                marker in normalized_message
-                for marker in (
-                    "频繁",
-                    "限流",
-                    "配额",
-                    "次数",
-                    "quota",
-                    "rate limit",
-                    "too many",
-                )
-            )
-            error_type = WeReadApiRateLimitError if is_rate_limit else WeReadApiError
-            raise error_type(error)
-
-        return data
+        return self.gateway.request(api_name, **params)
 
     def get_bookshelf(self):
         """获取完整电子书书架。"""
@@ -214,7 +64,7 @@ class WeReadApi:
         seen_cursors = set()
 
         while True:
-            params = {"count": 100}
+            params = {"count": NOTEBOOK_PAGE_SIZE}
             if last_sort is not None:
                 params["lastSort"] = last_sort
             data = self._request("/user/notebooks", **params)
@@ -229,7 +79,7 @@ class WeReadApi:
                 raise WeReadApiError("微信读书笔记本分页游标无效，已停止以避免重复同步")
             seen_cursors.add(next_cursor)
             last_sort = next_cursor
-            time.sleep(0.2)
+            self.sleep(0.2)
 
         formatted_books = []
         for notebook in notebooks:

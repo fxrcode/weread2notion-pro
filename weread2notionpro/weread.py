@@ -1,5 +1,6 @@
 import logging
 
+from weread2notionpro.logging_config import configure_logging
 from weread2notionpro.notion_helper import NotionHelper
 from weread2notionpro.utils import (
     get_block,
@@ -14,6 +15,7 @@ from weread2notionpro.weread_api import WeReadApi
 
 # 获取logger实例
 logger = logging.getLogger(__name__)
+configure_logging()
 
 
 def get_bookmark_list(page_id, bookId):

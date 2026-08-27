@@ -5,6 +5,7 @@ import pendulum
 
 from weread2notionpro import utils
 from weread2notionpro.config import book_properties_type_dict, tz
+from weread2notionpro.logging_config import configure_logging
 from weread2notionpro.notion_helper import NotionHelper
 from weread2notionpro.sync_batch import select_sync_batch
 from weread2notionpro.weread_api import (
@@ -15,6 +16,7 @@ from weread2notionpro.weread_api import (
 
 # 获取logger实例
 logger = logging.getLogger(__name__)
+configure_logging()
 
 TAG_ICON_URL = "https://www.notion.so/icons/tag_gray.svg"
 USER_ICON_URL = "https://www.notion.so/icons/user-circle-filled_gray.svg"

@@ -1,6 +1,8 @@
 import unittest
 from unittest import mock
 
+import requests
+
 from weread2notionpro.weread_api import (
     GATEWAY_URL,
     SKILL_VERSION,
@@ -8,6 +10,7 @@ from weread2notionpro.weread_api import (
     WeReadApiError,
     WeReadApiRateLimitError,
 )
+from weread2notionpro.weread_gateway import WeReadGateway
 
 
 class FakeResponse:
@@ -39,6 +42,10 @@ class FakeSession:
 
 
 class WeReadApiTest(unittest.TestCase):
+    def test_gateway_rejects_zero_attempts(self):
+        with self.assertRaisesRegex(ValueError, "至少为 1"):
+            WeReadGateway(api_key="wrk-test", max_attempts=0)
+
     def test_gateway_uses_api_key_and_flat_payload(self):
         session = FakeSession([{"books": []}])
         api = WeReadApi(api_key="wrk-test", session=session)
@@ -84,13 +91,16 @@ class WeReadApiTest(unittest.TestCase):
                 },
             ]
         )
-        api = WeReadApi(api_key="wrk-test", session=session)
+        sleep = mock.Mock()
+        api = WeReadApi(api_key="wrk-test", session=session, sleep=sleep)
 
         books = api.get_notebooklist()
 
         self.assertEqual([book["bookId"] for book in books], ["book-2", "book-1"])
         self.assertEqual(books[1]["bookmarkCount"], 3)
+        self.assertEqual(session.calls[0]["json"]["count"], 300)
         self.assertEqual(session.calls[1]["json"]["lastSort"], 20)
+        sleep.assert_called_once_with(0.2)
 
     def test_reviews_follow_synckey_cursor_and_unwrap_items(self):
         session = FakeSession(
@@ -199,13 +209,27 @@ class WeReadApiTest(unittest.TestCase):
                 {"updated": [{"bookmarkId": "bookmark-1"}]},
             ]
         )
-        api = WeReadApi(api_key="wrk-test", session=session)
+        api = WeReadApi(api_key="wrk-test", session=session, sleep=mock.Mock())
 
-        with mock.patch("weread2notionpro.weread_api.time.sleep"):
-            bookmarks = api.get_bookmark_list("book-1")
+        bookmarks = api.get_bookmark_list("book-1")
 
         self.assertEqual(bookmarks[0]["bookmarkId"], "bookmark-1")
         self.assertEqual(len(session.calls), 2)
+
+    def test_transport_exception_is_retried(self):
+        session = mock.Mock()
+        session.headers = {}
+        session.post.side_effect = [
+            requests.ConnectionError("temporarily unavailable"),
+            FakeResponse({"books": []}),
+        ]
+        sleep = mock.Mock()
+        api = WeReadApi(api_key="wrk-test", session=session, sleep=sleep)
+
+        api.get_bookshelf()
+
+        self.assertEqual(session.post.call_count, 2)
+        sleep.assert_called_once_with(1)
 
     def test_non_json_transient_error_is_retried(self):
         session = FakeSession(
@@ -215,21 +239,24 @@ class WeReadApiTest(unittest.TestCase):
             ]
         )
         session.responses[0].headers["Retry-After"] = "Wed, 26 Aug 2026 08:00:00 GMT"
-        api = WeReadApi(api_key="wrk-test", session=session)
+        sleep = mock.Mock()
+        api = WeReadApi(
+            api_key="wrk-test",
+            session=session,
+            sleep=sleep,
+        )
 
-        with mock.patch("weread2notionpro.weread_api.time.sleep") as sleep:
-            bookmarks = api.get_bookmark_list("book-1")
+        bookmarks = api.get_bookmark_list("book-1")
 
         self.assertEqual(bookmarks[0]["bookmarkId"], "bookmark-1")
         sleep.assert_called_once_with(60)
 
     def test_exhausted_rate_limit_has_distinct_error(self):
         session = FakeSession([({"errmsg": "busy"}, 499)] * 4)
-        api = WeReadApi(api_key="wrk-test", session=session)
+        api = WeReadApi(api_key="wrk-test", session=session, sleep=mock.Mock())
 
-        with mock.patch("weread2notionpro.weread_api.time.sleep"):
-            with self.assertRaises(WeReadApiRateLimitError):
-                api.get_bookmark_list("book-1")
+        with self.assertRaises(WeReadApiRateLimitError):
+            api.get_bookmark_list("book-1")
 
         self.assertEqual(len(session.calls), 4)
 
@@ -257,6 +284,16 @@ class WeReadApiTest(unittest.TestCase):
             api.get_bookmark_list("book-1")
 
         self.assertEqual(len(session.calls), 1)
+
+    def test_invalid_json_success_response_reports_payload_error(self):
+        session = FakeSession([(ValueError("invalid"), 200)])
+        api = WeReadApi(api_key="wrk-test", session=session)
+
+        with self.assertRaisesRegex(
+            WeReadApiError,
+            "返回了无效JSON.*HTTP状态码: 200",
+        ):
+            api.get_bookmark_list("book-1")
 
 
 if __name__ == "__main__":

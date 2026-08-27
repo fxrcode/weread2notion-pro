@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 import pendulum
 
+from weread2notionpro.logging_config import configure_logging
 from weread2notionpro.notion_helper import NotionHelper
 from weread2notionpro.utils import (
     format_date,
@@ -81,6 +82,7 @@ HEATMAP_GUIDE = "https://mp.weixin.qq.com/s?__biz=MzI1OTcxOTI4NA==&mid=224748414
 
 
 logger = logging.getLogger(__name__)
+configure_logging()
 notion_helper = NotionHelper()
 weread_api = WeReadApi()
 
