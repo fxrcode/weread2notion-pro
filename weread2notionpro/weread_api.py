@@ -90,20 +90,20 @@ class WeReadApi:
             book_info.update(
                 {
                     "bookId": book_id,
-                    "noteCount": notebook.get("noteCount", 0),
-                    "reviewCount": notebook.get("reviewCount", 0),
-                    "bookmarkCount": notebook.get("bookmarkCount", 0),
-                    "readingProgress": notebook.get("readingProgress", 0),
-                    "markedStatus": notebook.get("markedStatus", 0),
-                    "sort": notebook.get("sort", 0),
+                    "noteCount": notebook.get("noteCount") or 0,
+                    "reviewCount": notebook.get("reviewCount") or 0,
+                    "bookmarkCount": notebook.get("bookmarkCount") or 0,
+                    "readingProgress": notebook.get("readingProgress") or 0,
+                    "markedStatus": notebook.get("markedStatus") or 0,
+                    "sort": notebook.get("sort") or 0,
                 }
             )
             if book_info.get("deepLink"):
                 self._book_urls[book_id] = book_info["deepLink"]
             formatted_books.append(book_info)
 
-        # 先处理旧笔记；中途失败时不会越过尚未同步的较旧记录。
-        formatted_books.sort(key=lambda book: book.get("sort", 0))
+        # 使用稳定顺序，具体批次优先级由同步层决定。
+        formatted_books.sort(key=lambda book: book.get("sort") or 0)
         logger.info(f"获取到 {len(formatted_books)} 本有笔记的书")
         return formatted_books
 

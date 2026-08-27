@@ -1,6 +1,11 @@
 import logging
+import os
 
 from weread2notionpro.logging_config import configure_logging
+from weread2notionpro.note_sync import (
+    remote_collection_complete,
+    select_notebooks_to_sync,
+)
 from weread2notionpro.notion_helper import NotionHelper
 from weread2notionpro.utils import (
     get_block,
@@ -11,14 +16,18 @@ from weread2notionpro.utils import (
     get_rich_text_from_result,
     get_table_of_contents,
 )
-from weread2notionpro.weread_api import WeReadApi
+from weread2notionpro.weread_api import (
+    WeReadApi,
+    WeReadApiError,
+    WeReadApiRateLimitError,
+)
 
 # 获取logger实例
 logger = logging.getLogger(__name__)
 configure_logging()
 
 
-def get_bookmark_list(page_id, bookId):
+def get_bookmark_list(page_id, bookId, expected_count=0):
     """获取我的划线"""
     def is_exported_highlight(result):
         type_property = (result.get("properties") or {}).get("type")
@@ -47,6 +56,11 @@ def get_bookmark_list(page_id, bookId):
         if is_exported_highlight(x)
     }
     bookmarks = weread_api.get_bookmark_list(bookId)
+    if not remote_collection_complete(expected_count, len(bookmarks)):
+        raise WeReadApiError(
+            f"书籍 {bookId} 应有 {expected_count} 条划线，"
+            f"API仅返回 {len(bookmarks)} 条；保留现有Notion数据"
+        )
     for i in bookmarks:
         if i.get("bookmarkId") in dict1:
             i["blockId"] = dict1.pop(i.get("bookmarkId"))
@@ -56,7 +70,7 @@ def get_bookmark_list(page_id, bookId):
     return bookmarks
 
 
-def get_review_list(page_id, bookId):
+def get_review_list(page_id, bookId, expected_count=0):
     """获取笔记"""
     filter = {
         "and": [
@@ -73,6 +87,11 @@ def get_review_list(page_id, bookId):
     }
     dict2 = {get_rich_text_from_result(x, "blockId"): x.get("id") for x in results}
     reviews = weread_api.get_review_list(bookId)
+    if not remote_collection_complete(expected_count, len(reviews)):
+        raise WeReadApiError(
+            f"书籍 {bookId} 应有 {expected_count} 条想法，"
+            f"API仅返回 {len(reviews)} 条；保留现有Notion数据"
+        )
     for i in reviews:
         if i.get("reviewId") in dict1:
             i["blockId"] = dict1.pop(i.get("reviewId"))
@@ -256,38 +275,63 @@ notion_helper = NotionHelper()
 def main(target_book_id=None):
     notion_books = notion_helper.get_all_book()
     books = weread_api.get_notebooklist()
-    if books != None:
-        # 如果指定了目标书籍ID，只处理该书籍
-        if target_book_id:
-            books = [book for book in books if book.get("bookId") == target_book_id]
-            if not books:
-                logger.warning(f"未找到指定的书籍 {target_book_id}")
-                return
-            logger.info(f"指定同步书籍: {target_book_id}")
+    if books is None:
+        return
 
-        for index, book in enumerate(books):
+    if target_book_id:
+        books = [book for book in books if book.get("bookId") == target_book_id]
+        if not books:
+            logger.warning(f"未找到指定的书籍 {target_book_id}")
+            return
+        if target_book_id not in notion_books:
+            logger.warning(f"书籍 {target_book_id} 不在Notion数据库中，跳过同步")
+            return
+        logger.info(f"强制同步指定书籍: {target_book_id}")
+    else:
+        try:
+            sync_limit = max(int(os.getenv("NOTES_SYNC_LIMIT", "100")), 0)
+        except ValueError:
+            sync_limit = 100
+            logger.warning("笔记同步批次上限配置无效，使用默认值 100")
+        books, deferred_books, unchanged_books, missing_books = (
+            select_notebooks_to_sync(books, notion_books, sync_limit)
+        )
+        logger.info(
+            f"笔记同步计划：本次 {len(books)} 本，延后 {len(deferred_books)} 本，"
+            f"无需同步 {len(unchanged_books)} 本，Notion缺失 {len(missing_books)} 本"
+        )
+        if missing_books:
+            missing_preview = ", ".join(
+                f"《{book.get('title', '未知书名')}》({book.get('bookId')})"
+                for book in missing_books[:10]
+            )
+            logger.warning(f"Notion缺失书籍示例: {missing_preview}")
+
+    synced_count = 0
+    failed_count = 0
+    stopped_by_quota = False
+    for index, book in enumerate(books):
+        try:
             bookId = book.get("bookId")
             title = book.get("title")
             author = book.get("author", "未知作者")
             sort = book.get("sort")
             note_count = book.get("noteCount", 0)
             review_count = book.get("reviewCount", 0)
+            bookmark_count = book.get("bookmarkCount", 0)
 
             logger.info(f"\n{'=' * 60}")
             logger.info(f"开始处理第 {index + 1}/{len(books)} 本书籍")
             logger.info(f"书籍信息: 《{title}》 - {author}")
             logger.info(f"书籍ID: {bookId}")
-            logger.info(f"笔记统计: {note_count} 个标注, {review_count} 个想法")
+            logger.info(
+                f"笔记统计: {note_count} 个划线, {review_count} 个想法, "
+                f"{bookmark_count} 个书签"
+            )
             logger.info(f"排序值: {sort}")
 
             if not title:
                 logger.warning(f"跳过书籍 {bookId}，缺少书籍标题")
-                continue
-            if bookId not in notion_books:
-                logger.info(f"书籍《{title}》不在Notion数据库中，跳过同步")
-                continue
-            if sort == notion_books.get(bookId).get("Sort"):
-                logger.info(f"书籍《{title}》的排序值未变化，跳过同步")
                 continue
 
             pageId = notion_books.get(bookId).get("pageId")
@@ -296,10 +340,10 @@ def main(target_book_id=None):
             chapter = weread_api.get_chapter_info(bookId)
             logger.info(f"获取章节信息完成，章节数: {len(chapter) if chapter else 0}")
 
-            bookmark_list = get_bookmark_list(pageId, bookId)
+            bookmark_list = get_bookmark_list(pageId, bookId, note_count)
             logger.info(f"获取标注列表完成，标注数: {len(bookmark_list)}")
 
-            reviews = get_review_list(pageId, bookId)
+            reviews = get_review_list(pageId, bookId, review_count)
             logger.info(f"获取想法列表完成，想法数: {len(reviews)}")
 
             bookmark_list.extend(reviews)
@@ -312,11 +356,40 @@ def main(target_book_id=None):
             append_blocks(pageId, content)
             logger.info("笔记内容写入完成")
 
-            properties = {"Sort": get_number(sort)}
+            properties = {
+                "Sort": get_number(sort),
+                "微信读书划线数": get_number(note_count),
+                "微信读书想法数": get_number(review_count),
+                "微信读书书签数": get_number(bookmark_count),
+            }
             notion_helper.update_book_page(page_id=pageId, properties=properties)
             logger.info("书籍属性更新完成")
             logger.info(f"《{title}》同步完成！")
             logger.info(f"{'=' * 60}\n")
+            synced_count += 1
+        except WeReadApiRateLimitError as exc:
+            logger.error(f"微信读书 API 配额不足，停止笔记同步: {exc}")
+            stopped_by_quota = True
+            break
+        except WeReadApiError as exc:
+            logger.error(f"书籍 {book.get('bookId')} API数据不完整，跳过: {exc}")
+            failed_count += 1
+            continue
+        except Exception as exc:
+            logger.error(f"书籍 {book.get('bookId')} 同步失败，跳过: {exc}")
+            failed_count += 1
+            continue
+
+    summary = (
+        f"笔记同步结束：成功 {synced_count} 本，失败 {failed_count} 本，"
+        f"本次未处理 {len(books) - synced_count - failed_count} 本"
+    )
+    if books and synced_count == 0:
+        logger.error(summary)
+    elif stopped_by_quota:
+        logger.warning(summary)
+    else:
+        logger.info(summary)
 
 
 if __name__ == "__main__":

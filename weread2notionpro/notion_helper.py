@@ -25,6 +25,8 @@ from weread2notionpro.utils import (
     timestamp_to_date,
 )
 
+logger = logging.getLogger(__name__)
+
 TAG_ICON_URL = "https://www.notion.so/icons/tag_gray.svg"
 USER_ICON_URL = "https://www.notion.so/icons/user-circle-filled_gray.svg"
 TARGET_ICON_URL = "https://www.notion.so/icons/target_red.svg"
@@ -166,6 +168,18 @@ class NotionHelper:
             or properties.get("豆瓣短评").get("type") != "rich_text"
         ):
             update_properties["豆瓣短评"] = {"rich_text": {}}
+        for property_name in (
+            "微信读书划线数",
+            "微信读书想法数",
+            "微信读书书签数",
+        ):
+            if properties.get(property_name) is None:
+                update_properties[property_name] = {"number": {}}
+            elif properties.get(property_name).get("type") != "number":
+                logger.warning(
+                    f"书架数据库属性“{property_name}”已存在但不是数字类型，"
+                    "不会覆盖用户配置"
+                )
         """NeoDB先不添加了，现在受众还不广，可能有的小伙伴不知道是干什么的"""
         if len(update_properties) > 0:
             self.client.databases.update(database_id=id, properties=update_properties)
@@ -486,6 +500,15 @@ class NotionHelper:
                     result.get("properties").get("书架分类")
                 ),
                 "Sort": get_property_value(result.get("properties").get("Sort")),
+                "noteCount": get_property_value(
+                    result.get("properties").get("微信读书划线数")
+                ),
+                "reviewCount": get_property_value(
+                    result.get("properties").get("微信读书想法数")
+                ),
+                "bookmarkCount": get_property_value(
+                    result.get("properties").get("微信读书书签数")
+                ),
                 "douban_url": get_property_value(
                     result.get("properties").get("豆瓣链接")
                 ),

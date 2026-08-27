@@ -24,6 +24,7 @@ jobs:
       NOTION_PAGE: ${{ secrets.NOTION_PAGE }}
       WEREAD_API_KEY: ${{ secrets.WEREAD_API_KEY }}
       REPAIR_ZERO_READING_TIME: ${{ github.event.inputs.repair_zero_reading_time || 'false' }}
+      NOTES_SYNC_LIMIT: ${{ vars.NOTES_SYNC_LIMIT || '100' }}
       BOOK_DATABASE_NAME: ${{ vars.BOOK_DATABASE_NAME }}
       AUTHOR_DATABASE_NAME: ${{ vars.AUTHOR_DATABASE_NAME }}
       CATEGORY_DATABASE_NAME: ${{ vars.CATEGORY_DATABASE_NAME }}
@@ -51,13 +52,14 @@ jobs:
           pip install -r requirements.txt
           pip install -e .
 
-      - name: weread book sync
-        run: |
-          book
-
-      - name: weread sync
+      - name: weread note sync
         run: |
           weread
+
+      - name: weread book sync
+        if: ${{ always() }}
+        run: |
+          book
 
       - name: Upload logs as artifacts
         uses: actions/upload-artifact@v4
