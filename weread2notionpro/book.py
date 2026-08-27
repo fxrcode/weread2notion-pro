@@ -6,6 +6,7 @@ import pendulum
 from weread2notionpro import utils
 from weread2notionpro.config import book_properties_type_dict, tz
 from weread2notionpro.notion_helper import NotionHelper
+from weread2notionpro.sync_batch import select_sync_batch
 from weread2notionpro.weread_api import (
     WeReadApi,
     WeReadApiError,
@@ -39,6 +40,8 @@ def insert_book_to_notion(books, index, bookId, all_books_dict=None):
                 shelf_book.update(
                     {key: value for key, value in book_info.items() if value}
                 )
+            except WeReadApiRateLimitError:
+                raise
             except WeReadApiError as exc:
                 logger.warning(
                     f"   获取新书 {bookId} 的详情失败，使用书架摘要继续同步: {exc}"
@@ -502,17 +505,8 @@ def main():
         repair_zero_reading_time = (
             os.getenv("REPAIR_ZERO_READING_TIME", "false").lower() == "true"
         )
-        try:
-            repair_limit = max(
-                int(os.getenv("REPAIR_ZERO_READING_TIME_LIMIT", "400")), 0
-            )
-        except ValueError:
-            repair_limit = 400
-            logger.warning("   修复批次上限配置无效，使用默认值 400")
         if repair_zero_reading_time:
-            logger.warning(
-                f"   已启用零阅读时长修复模式，本次最多修复 {repair_limit} 本"
-            )
+            logger.warning("   已启用零阅读时长修复模式")
         for key, value in notion_books.items():
             shelf_book = all_books_dict.get(key, {})
             shelf_update_time = shelf_book.get("readUpdateTime") or 0
@@ -548,26 +542,10 @@ def main():
                 else:
                     not_need_sync.append(key)
 
-        selected_repairs = repair_candidates
-        if repair_candidates and len(repair_candidates) > repair_limit:
-            run_number = int(os.getenv("GITHUB_RUN_NUMBER", "0") or 0)
-            start = (run_number * repair_limit) % len(repair_candidates)
-            rotated_candidates = (
-                repair_candidates[start:] + repair_candidates[:start]
-            )
-            selected_repairs = rotated_candidates[:repair_limit]
-        selected_repair_ids = set(selected_repairs)
-        deferred_repairs = [
-            book_id
-            for book_id in repair_candidates
-            if book_id not in selected_repair_ids
-        ]
-        not_need_sync.extend(deferred_repairs)
         if repair_zero_reading_time:
             logger.warning(
-                f"   找到 {len(repair_candidates)} 本待修复书籍，本次处理 "
-                f"{len(selected_repairs)} 本，"
-                f"延后 {len(deferred_repairs)} 本"
+                f"   找到 {len(repair_candidates)} 本待修复书籍，"
+                "与其他待更新书籍共用本次同步批次"
             )
         logger.info(f"   {len(not_need_sync)} 本书无需同步")
 
@@ -585,17 +563,40 @@ def main():
         # 使用所有书架书籍，去除无需同步的书籍
         not_need_sync_ids = set(not_need_sync)
         books = [book_id for book_id in all_book_ids if book_id not in not_need_sync_ids]
+        try:
+            sync_limit = max(int(os.getenv("BOOK_SYNC_LIMIT", "400")), 0)
+        except ValueError:
+            sync_limit = 400
+            logger.warning("   书架同步批次上限配置无效，使用默认值 400")
+        try:
+            run_number = int(os.getenv("GITHUB_RUN_NUMBER", "0") or 0)
+        except ValueError:
+            run_number = 0
+        books, deferred_books = select_sync_batch(
+            books,
+            sync_limit,
+            run_number=run_number,
+        )
+        if deferred_books:
+            logger.warning(
+                f"   为保留笔记同步的 API 配额，本次书架同步限制为 "
+                f"{sync_limit} 本，延后 {len(deferred_books)} 本"
+            )
         logger.info(f"   共需要同步 {len(books)} 本书")
 
         logger.info("8. 开始同步书籍...")
+        synced_count = 0
+        stopped_by_gateway = False
         for index, bookId in enumerate(books):
             logger.info(f"   正在同步第 {index + 1}/{len(books)} 本书 (ID: {bookId})")
             try:
                 insert_book_to_notion(books, index, bookId, all_books_dict)
+                synced_count += 1
                 logger.info(f"   ✓ 书籍 {bookId} 同步成功")
-            except WeReadApiRateLimitError:
-                logger.error("   微信读书 API 配额已耗尽，立即停止书架同步")
-                raise
+            except WeReadApiRateLimitError as e:
+                logger.error(f"   微信读书 API 已拒绝继续请求，停止书架同步: {e}")
+                stopped_by_gateway = True
+                break
             except WeReadApiError as e:
                 logger.error(f"   ✗ 书籍 {bookId} API请求失败: {str(e)}")
                 continue
@@ -603,7 +604,13 @@ def main():
                 logger.error(f"   ✗ 书籍 {bookId} 同步失败: {str(e)}")
                 continue
 
-        logger.info("同步完成！")
+        if stopped_by_gateway:
+            logger.warning(
+                f"书架同步提前停止：已完成 {synced_count}/{len(books)} 本，"
+                "继续执行笔记同步"
+            )
+        else:
+            logger.info(f"同步完成！已成功同步 {synced_count}/{len(books)} 本")
 
     except Exception as e:
         logger.error(f"同步过程中发生错误: {str(e)}")

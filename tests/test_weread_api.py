@@ -240,6 +240,24 @@ class WeReadApiTest(unittest.TestCase):
         with self.assertRaises(WeReadApiRateLimitError):
             api.get_bookmark_list("book-1")
 
+    def test_empty_403_stops_as_rate_limit(self):
+        session = FakeSession([(ValueError("empty body"), 403)])
+        api = WeReadApi(api_key="wrk-test", session=session)
+
+        with self.assertRaises(WeReadApiRateLimitError):
+            api.get_bookmark_list("book-1")
+
+        self.assertEqual(len(session.calls), 1)
+
+    def test_json_403_stops_as_rate_limit(self):
+        session = FakeSession([({"errmsg": "forbidden"}, 403)])
+        api = WeReadApi(api_key="wrk-test", session=session)
+
+        with self.assertRaises(WeReadApiRateLimitError):
+            api.get_bookmark_list("book-1")
+
+        self.assertEqual(len(session.calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

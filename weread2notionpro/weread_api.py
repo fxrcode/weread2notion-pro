@@ -109,9 +109,17 @@ class WeReadApi:
                     )
                     time.sleep(delay)
                     continue
-                raise WeReadApiError(
-                    f"微信读书API返回了无效JSON ({api_name})"
-                ) from exc
+                error = (
+                    f"微信读书API返回了无效JSON ({api_name})，"
+                    f"HTTP状态码: {response.status_code}"
+                )
+                logger.error(error)
+                error_type = (
+                    WeReadApiRateLimitError
+                    if response.status_code in (403, 429, 499)
+                    else WeReadApiError
+                )
+                raise error_type(error) from exc
 
             if response.status_code < 400:
                 break
@@ -139,7 +147,7 @@ class WeReadApi:
             logger.error(error)
             error_type = (
                 WeReadApiRateLimitError
-                if response.status_code in (429, 499)
+                if response.status_code in (403, 429, 499)
                 else WeReadApiError
             )
             raise error_type(error)
